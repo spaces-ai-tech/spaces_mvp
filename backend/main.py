@@ -9,6 +9,9 @@ from models import (
     ImageUploadResponse,
     ImprovementMarkersRequest,
     ImprovementMarkersResponse,
+    InspirationAnalysisRequest,
+    InspirationAnalysisResponse,
+    InspirationUploadResponse,
     MarkerRecommendationsResponse,
     ProjectCreateResponse,
     ProjectResponse,
@@ -214,6 +217,122 @@ async def get_marker_recommendations(project_id: str):
         recommendations=project["context"]["marker_recommendations"],
         status=project["status"],
     )
+
+
+# Inspiration Analysis Endpoints
+@app.post(
+    "/projects/{project_id}/upload-inspirations",
+    response_model=InspirationUploadResponse,
+)
+async def upload_inspiration_images(
+    project_id: str, images: list[UploadFile] = File(...)
+):
+    """Upload inspiration images for a project (up to 5)"""
+    # Validate number of files
+    if len(images) > 5:
+        raise HTTPException(
+            status_code=400, detail="Maximum 5 inspiration images allowed"
+        )
+
+    # Validate file types
+    for image in images:
+        if not image.content_type.startswith("image/"):
+            raise HTTPException(status_code=400, detail="All files must be images")
+
+    try:
+        inspiration_images = data_manager.upload_inspiration_images(project_id, images)
+        project = data_manager.get_project(project_id)
+
+        return InspirationUploadResponse(
+            project_id=project_id,
+            inspiration_images=inspiration_images,
+            status=project["status"],
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to upload inspiration images: {str(e)}"
+        )
+
+
+@app.get("/projects/{project_id}/inspiration-images")
+async def get_inspiration_images(project_id: str):
+    """Get inspiration images for a project"""
+    try:
+        inspiration_images = data_manager.get_inspiration_images(project_id)
+        return {"project_id": project_id, "inspiration_images": inspiration_images}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to get inspiration images: {str(e)}"
+        )
+
+
+@app.get("/projects/{project_id}/inspiration-images/{image_id}")
+async def get_inspiration_image(project_id: str, image_id: str):
+    """Get a specific inspiration image file"""
+    try:
+        image_path = data_manager.get_inspiration_image_path(project_id, image_id)
+
+        if not Path(image_path).exists():
+            raise HTTPException(
+                status_code=404, detail="Inspiration image file not found"
+            )
+
+        return FileResponse(image_path)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to get inspiration image: {str(e)}"
+        )
+
+
+@app.post(
+    "/projects/{project_id}/analyze-inspirations",
+    response_model=InspirationAnalysisResponse,
+)
+async def analyze_inspirations(
+    project_id: str, analysis_request: InspirationAnalysisRequest
+):
+    """Analyze inspiration images and generate design insights"""
+    try:
+        analysis = data_manager.analyze_inspirations(project_id)
+        project = data_manager.get_project(project_id)
+
+        return InspirationAnalysisResponse(
+            project_id=project_id,
+            analysis=analysis,
+            status=project["status"],
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to analyze inspirations: {str(e)}"
+        )
+
+
+@app.get("/projects/{project_id}/inspiration-analysis")
+async def get_inspiration_analysis(project_id: str):
+    """Get inspiration analysis for a project"""
+    try:
+        analysis = data_manager.get_inspiration_analysis(project_id)
+        project = data_manager.get_project(project_id)
+
+        return {
+            "project_id": project_id,
+            "analysis": analysis,
+            "status": project["status"],
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to get inspiration analysis: {str(e)}"
+        )
 
 
 if __name__ == "__main__":

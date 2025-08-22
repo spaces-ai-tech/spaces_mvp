@@ -2,6 +2,8 @@
 
 import { ImageMarkerInterface } from "@/components/ImageMarkerInterface";
 import { ImageUploadSection } from "@/components/ImageUploadSection";
+import { InspirationAnalysis } from "@/components/InspirationAnalysis";
+import { InspirationUploadSection } from "@/components/InspirationUploadSection";
 import { LabelledImageDisplay } from "@/components/LabelledImageDisplay";
 import { MarkerRecommendations } from "@/components/MarkerRecommendations";
 import { ProjectContext } from "@/components/ProjectContext";
@@ -156,6 +158,19 @@ export default function ProjectPage() {
               <MarkerRecommendations projectId={project.project_id} />
             </>
           )}
+
+          {/* Inspiration Analysis Section */}
+          <InspirationUploadSection
+            projectId={project.project_id}
+            status={project.status}
+            context={project.context}
+          />
+
+          <InspirationAnalysis
+            projectId={project.project_id}
+            status={project.status}
+            context={project.context}
+          />
         </main>
       </div>
     </div>

@@ -135,7 +135,7 @@ This is an active development repository for testing agentic AI backend architec
 - ✅ Dynamic project pages with URL-based routing
 - ✅ Error handling for non-existent projects
 - ✅ Image upload functionality with file storage
-- ✅ Project status management (NEW → BASE_IMAGE_UPLOADED → SPACE_TYPE_SELECTED → IMPROVEMENT_MARKERS_ADDED)
+- ✅ Project status management (NEW → BASE_IMAGE_UPLOADED → SPACE_TYPE_SELECTED → IMPROVEMENT_MARKERS_ADDED → MARKER_RECOMMENDATIONS_READY → INSPIRATIONS_UPLOADED → INSPIRATION_ANALYSIS_READY)
 - ✅ Base image retrieval endpoint
 - ✅ Image display on project pages
 - ✅ OpenAI client with Pydantic-based structured responses (responses.parse)
@@ -165,6 +165,13 @@ This is an active development repository for testing agentic AI backend architec
   - ✅ AI analysis using both base and labelled images
   - ✅ Clean, numbered list UI for recommendations
   - ✅ Project status progression to MARKER_RECOMMENDATIONS_READY
+- ✅ **Inspiration analysis system**
+  - ✅ Upload up to 5 inspiration images with drag & drop interface
+  - ✅ Multi-image AI analysis using OpenAI Vision API
+  - ✅ Comprehensive design insights (style, color, furniture, materials, lighting)
+  - ✅ Pattern recognition across multiple inspiration images
+  - ✅ Clean, numbered list UI for analysis results
+  - ✅ Project status progression to INSPIRATIONS_UPLOADED → INSPIRATION_ANALYSIS_READY
 
 ## User Flow
 
@@ -177,12 +184,15 @@ This is an active development repository for testing agentic AI backend architec
 5. **Place Markers** → Click to place up to 5 improvement markers with descriptions
 6. **Save Markers** → Generate labelled image and AI recommendations
 7. **View Recommendations** → See simple, actionable design suggestions as a numbered list
+8. **Upload Inspiration Images** → Upload up to 5 inspiration images with drag & drop
+9. **Generate Analysis** → AI analyzes all inspiration images together
+10. **View Design Insights** → See comprehensive design analysis with patterns and themes
 
 ## Data Structure
 
 ```json
 {
-  "status": "MARKER_RECOMMENDATIONS_READY",
+  "status": "INSPIRATION_ANALYSIS_READY",
   "context": {
     "base_image": "/path/to/original.jpg",
     "labelled_base_image": "/path/to/marked.jpg",
@@ -200,6 +210,21 @@ This is an active development repository for testing agentic AI backend architec
       "Add a round coffee table at marker 1 for better flow and functionality",
       "Install ambient lighting at marker 2 to create a warm atmosphere",
       "Place a decorative tray and plants at marker 3 for visual interest"
+    ],
+    "inspiration_images": [
+      {
+        "id": "inspiration_1",
+        "filename": "inspiration_1.jpg",
+        "path": "/path/to/inspiration_1.jpg",
+        "uploaded_at": "2024-01-01T12:00:00"
+      }
+    ],
+    "inspiration_analysis": [
+      "Modern minimalist aesthetic with clean lines and neutral tones",
+      "Emphasis on natural materials and organic textures",
+      "Open floor plan with flexible furniture arrangements",
+      "Layered lighting design with multiple light sources",
+      "Cohesive color palette with accent colors for visual interest"
     ]
   }
 }

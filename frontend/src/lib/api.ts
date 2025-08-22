@@ -102,6 +102,32 @@ export interface SpaceTypeResponse {
   message: string;
 }
 
+// New inspiration-related types
+export interface InspirationImage {
+  id: string;
+  filename: string;
+  path: string;
+  uploaded_at: string;
+}
+
+export interface InspirationUploadResponse {
+  project_id: string;
+  inspiration_images: InspirationImage[];
+  status: string;
+  message: string;
+}
+
+export interface InspirationAnalysisRequest {
+  // Empty for now, no additional data needed
+}
+
+export interface InspirationAnalysisResponse {
+  project_id: string;
+  analysis: string[];
+  status: string;
+  message: string;
+}
+
 export interface ImprovementMarker {
   id: string;
   position: { x: number; y: number };
@@ -245,3 +271,87 @@ export const useGetMarkerRecommendations = (projectId: string) => {
     staleTime: 5 * 60 * 1000, // 5 minutes
   });
 };
+
+// New inspiration-related API functions
+export const useUploadInspirationImages = () => {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      projectId,
+      files,
+    }: {
+      projectId: string;
+      files: File[];
+    }) => {
+      const formData = new FormData();
+      files.forEach((file) => {
+        formData.append("images", file);
+      });
+
+      return fetch(
+        `${API_BASE_URL}/projects/${projectId}/upload-inspirations`,
+        {
+          method: "POST",
+          body: formData,
+        }
+      ).then((response) => {
+        if (!response.ok) {
+          throw new Error(`API request failed: ${response.statusText}`);
+        }
+        return response.json() as Promise<InspirationUploadResponse>;
+      });
+    },
+    onSuccess: (data) => {
+      // Invalidate the project query to refresh the data
+      queryClient.invalidateQueries({ queryKey: ["project", data.project_id] });
+    },
+  });
+};
+
+export const useGetInspirationImages = (projectId: string) => {
+  return useQuery({
+    queryKey: ["inspiration-images", projectId],
+    queryFn: () =>
+      apiClient.get<{
+        project_id: string;
+        inspiration_images: InspirationImage[];
+      }>(`/projects/${projectId}/inspiration-images`),
+    enabled: !!projectId,
+    staleTime: 5 * 60 * 1000, // 5 minutes
+  });
+};
+
+export const useAnalyzeInspirations = () => {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({ projectId }: { projectId: string }) =>
+      apiClient.post<InspirationAnalysisResponse>(
+        `/projects/${projectId}/analyze-inspirations`,
+        {}
+      ),
+    onSuccess: (data) => {
+      // Invalidate the project query to refresh the data
+      queryClient.invalidateQueries({ queryKey: ["project", data.project_id] });
+    },
+  });
+};
+
+export const useGetInspirationAnalysis = (projectId: string) => {
+  return useQuery({
+    queryKey: ["inspiration-analysis", projectId],
+    queryFn: () =>
+      apiClient.get<{
+        project_id: string;
+        analysis: string[];
+        status: string;
+      }>(`/projects/${projectId}/inspiration-analysis`),
+    enabled: !!projectId,
+    staleTime: 5 * 60 * 1000, // 5 minutes
+  });
+};
+
+// Helper function to get inspiration image URL
+export const getInspirationImageUrl = (projectId: string, imageId: string) =>
+  `${API_BASE_URL}/projects/${projectId}/inspiration-images/${imageId}`;

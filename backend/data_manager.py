@@ -354,6 +354,198 @@ class DataManager:
         self._save_projects(projects)
         return labelled_image_path
 
+    def upload_inspiration_images(
+        self, project_id: str, image_files: List[UploadFile]
+    ) -> List[dict]:
+        """Upload inspiration images for a project (up to 5)"""
+        projects = self._load_projects()
+
+        if project_id not in projects:
+            raise ValueError(f"Project {project_id} not found")
+
+        # Limit to 5 inspiration images
+        if len(image_files) > 5:
+            raise ValueError("Maximum 5 inspiration images allowed")
+
+        # Create project-specific inspiration directory
+        project_inspirations_dir = IMAGES_DIR / project_id / "inspirations"
+        project_inspirations_dir.mkdir(exist_ok=True)
+
+        inspiration_images = []
+
+        for i, image_file in enumerate(image_files):
+            # Generate unique filename
+            file_extension = Path(image_file.filename).suffix
+            inspiration_filename = f"inspiration_{i + 1}{file_extension}"
+            inspiration_path = project_inspirations_dir / inspiration_filename
+
+            # Save the image file
+            with open(inspiration_path, "wb") as buffer:
+                shutil.copyfileobj(image_file.file, buffer)
+
+            # Create inspiration image record
+            inspiration_image = {
+                "id": f"inspiration_{i + 1}",
+                "filename": inspiration_filename,
+                "path": str(inspiration_path),
+                "uploaded_at": datetime.now().isoformat(),
+            }
+            inspiration_images.append(inspiration_image)
+
+        # Update project with inspiration images and status
+        projects[project_id]["context"]["inspiration_images"] = inspiration_images
+        projects[project_id]["status"] = "INSPIRATIONS_UPLOADED"
+
+        self._save_projects(projects)
+        return inspiration_images
+
+    def analyze_inspirations(self, project_id: str) -> List[str]:
+        """Analyze inspiration images and generate design insights"""
+        projects = self._load_projects()
+
+        if project_id not in projects:
+            raise ValueError(f"Project {project_id} not found")
+
+        inspiration_images = projects[project_id]["context"].get(
+            "inspiration_images", []
+        )
+        space_type = projects[project_id]["context"].get("space_type")
+
+        if not inspiration_images:
+            raise ValueError("No inspiration images found for this project")
+
+        if not space_type:
+            raise ValueError("No space type selected for this project")
+
+        # Generate AI analysis of inspiration images
+        analysis = self._generate_inspiration_analysis(space_type, inspiration_images)
+
+        # Update project with analysis and status
+        projects[project_id]["context"]["inspiration_analysis"] = analysis
+        projects[project_id]["status"] = "INSPIRATION_ANALYSIS_READY"
+
+        self._save_projects(projects)
+        return analysis
+
+    def get_inspiration_images(self, project_id: str) -> List[dict]:
+        """Get inspiration images for a project"""
+        projects = self._load_projects()
+
+        if project_id not in projects:
+            raise ValueError(f"Project {project_id} not found")
+
+        return projects[project_id]["context"].get("inspiration_images", [])
+
+    def get_inspiration_analysis(self, project_id: str) -> List[str]:
+        """Get inspiration analysis for a project"""
+        projects = self._load_projects()
+
+        if project_id not in projects:
+            raise ValueError(f"Project {project_id} not found")
+
+        return projects[project_id]["context"].get("inspiration_analysis", [])
+
+    def _generate_inspiration_analysis(
+        self, space_type: str, inspiration_images: List[dict]
+    ) -> List[str]:
+        """
+        Generate AI analysis of inspiration images
+
+        Args:
+            space_type: Type of space (living room, bedroom, etc.)
+            inspiration_images: List of inspiration image data
+
+        Returns:
+            List of analysis bullet points
+        """
+        try:
+            # Create a Pydantic model for the AI response
+            from typing import List
+
+            from pydantic import BaseModel
+
+            class InspirationAnalysisResponse(BaseModel):
+                analysis_points: List[str]
+
+            # Extract image paths for analysis
+            image_paths = [img["path"] for img in inspiration_images]
+
+            # Build the prompt with inspiration image information
+            image_info = "\n".join(
+                [
+                    f"Image {i + 1}: {img['filename']}"
+                    for i, img in enumerate(inspiration_images)
+                ]
+            )
+
+            prompt = f"""
+            Analyze these {len(inspiration_images)} inspiration images for a {space_type} design project and provide comprehensive design insights.
+
+            Space Type: {space_type}
+            
+            Inspiration Images to Analyze:
+            {image_info}
+
+            Please provide key analysis points that cover:
+
+            1. **Overall Design Style**: What is the predominant design style across all images?
+            2. **Color Palette Analysis**: What color schemes and palettes are most common?
+            3. **Furniture & Layout Patterns**: What furniture arrangements and layout principles emerge?
+            4. **Material & Texture Trends**: What materials, textures, and finishes are prominent?
+            5. **Lighting & Atmosphere**: How is lighting used to create mood and atmosphere?
+            6. **Recurring Design Elements**: What specific elements appear across multiple images?
+            7. **Space Utilization**: How is the space being used and organized?
+            8. **Design Cohesion**: What makes these images work together as inspiration?
+            9. **Practical Applications**: How can these insights be applied to the target space?
+            10. **Design Direction**: What specific direction should the project take based on these inspirations?
+
+            Focus on identifying patterns, themes, and actionable insights that can guide the design process.
+            Consider both individual image characteristics and collective trends across all images.
+            """
+
+            # Analyze all inspiration images together
+            result = self.openai_client.analyze_multiple_images_with_vision(
+                prompt=prompt,
+                pydantic_model=InspirationAnalysisResponse,
+                image_paths=image_paths,
+                system_message="You are an expert interior designer and design analyst with deep knowledge of design principles, color theory, and spatial planning. Analyze multiple inspiration images to extract comprehensive design insights, identify patterns and themes, and provide actionable guidance for design projects. Focus on practical, implementable insights that can inform design decisions.",
+            )
+
+            return result.analysis_points
+
+        except Exception as e:
+            print(f"Error generating inspiration analysis: {e}")
+            # Return default analysis if AI analysis fails
+            return [
+                f"Analysis of {len(inspiration_images)} inspiration images for {space_type} design",
+                "Modern minimalist aesthetic with clean lines and neutral tones",
+                "Emphasis on natural materials and organic textures",
+                "Open floor plan with flexible furniture arrangements",
+                "Layered lighting design with multiple light sources",
+                "Cohesive color palette with accent colors for visual interest",
+                "Balanced mix of functionality and aesthetic appeal",
+                "Attention to detail in material selection and finishes",
+            ]
+
+    def get_inspiration_image_path(self, project_id: str, image_id: str) -> str:
+        """Get the file path for a specific inspiration image"""
+        projects = self._load_projects()
+
+        if project_id not in projects:
+            raise ValueError(f"Project {project_id} not found")
+
+        inspiration_images = projects[project_id]["context"].get(
+            "inspiration_images", []
+        )
+
+        for img in inspiration_images:
+            if img["id"] == image_id:
+                return img["path"]
+
+        raise ValueError(
+            f"Inspiration image {image_id} not found in project {project_id}"
+        )
+
 
 # Global instance
 data_manager = DataManager()
