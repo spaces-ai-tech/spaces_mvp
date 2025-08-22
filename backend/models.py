@@ -68,3 +68,29 @@ class MarkerRecommendationsResponse(BaseModel):
     recommendations: List[str]
     status: str
     message: str = "Marker recommendations generated successfully"
+
+
+# New models for inspiration analysis
+class InspirationImage(BaseModel):
+    id: str
+    filename: str
+    path: str
+    uploaded_at: str
+
+
+class InspirationUploadResponse(BaseModel):
+    project_id: str
+    inspiration_images: List[InspirationImage]
+    status: str
+    message: str = "Inspiration images uploaded successfully"
+
+
+class InspirationAnalysisRequest(BaseModel):
+    pass  # No additional data needed, uses existing inspiration images
+
+
+class InspirationAnalysisResponse(BaseModel):
+    project_id: str
+    analysis: List[str]
+    status: str
+    message: str = "Inspiration analysis generated successfully"

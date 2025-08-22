@@ -1,5 +1,5 @@
 import os
-from typing import Any, Dict, Optional, TypeVar, Union
+from typing import Any, Dict, List, Optional, TypeVar, Union
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -177,6 +177,75 @@ class OpenAIClient:
                     ],
                 }
             )
+
+            # Prepare parameters
+            params = {
+                "model": model,
+                "input": input_messages,
+                "text_format": pydantic_model,
+            }
+
+            if max_tokens:
+                params["max_tokens"] = max_tokens
+
+            # Make the API call using the new responses.parse method
+            response = self.client.responses.parse(**params)
+
+            # Return the parsed Pydantic model
+            return response.output_parsed
+
+        except Exception as e:
+            raise Exception(f"OpenAI API error: {str(e)}")
+
+    def analyze_multiple_images_with_vision(
+        self,
+        prompt: str,
+        pydantic_model: type[T],
+        image_paths: List[str],
+        model: str = DEFAULT_MODEL,
+        max_tokens: Optional[int] = None,
+        system_message: Optional[str] = None,
+    ) -> T:
+        """
+        Analyze multiple images using vision API with structured output
+
+        Args:
+            prompt: The prompt describing what to analyze in the images
+            pydantic_model: Pydantic model class for structured output
+            image_paths: List of paths to image files
+            model: The vision model to use (default: gpt-4o-mini)
+            max_tokens: Maximum tokens in response
+            system_message: Optional system message to guide the model
+
+        Returns:
+            Parsed Pydantic model instance
+        """
+        try:
+            import base64
+
+            # Prepare input messages with multiple images
+            input_messages = []
+
+            if system_message:
+                input_messages.append({"role": "system", "content": system_message})
+
+            # Create content array with text and multiple images
+            content = [{"type": "input_text", "text": prompt}]
+
+            # Add each image to the content
+            for i, image_path in enumerate(image_paths):
+                # Read and encode the image
+                with open(image_path, "rb") as image_file:
+                    image_data = base64.b64encode(image_file.read()).decode("utf-8")
+
+                content.append(
+                    {
+                        "type": "input_image",
+                        "image_url": f"data:image/jpeg;base64,{image_data}",
+                    }
+                )
+
+            input_messages.append({"role": "user", "content": content})
 
             # Prepare parameters
             params = {
