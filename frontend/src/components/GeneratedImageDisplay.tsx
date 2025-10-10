@@ -2,6 +2,7 @@
 
 import { useGenerateImage } from "@/lib/api";
 import { useState } from "react";
+import { FurnitureIdentificationPanel } from "./FurnitureIdentificationPanel";
 
 interface SelectedProduct {
   url: string;
@@ -10,11 +11,24 @@ interface SelectedProduct {
   selected_at: string;
 }
 
+interface ColorScheme {
+  palette_name: string;
+  colors: string[];
+  keep_original?: boolean;
+}
+
+interface DesignStyle {
+  style_name: string;
+  keep_original?: boolean;
+}
+
 interface GeneratedImageDisplayProps {
   projectId: string;
   selectedProduct: SelectedProduct;
   generatedImageBase64?: string; // Changed from URL to base64
   generationPrompt?: string;
+  colorScheme?: ColorScheme;
+  designStyle?: DesignStyle;
 }
 
 export function GeneratedImageDisplay({
@@ -22,9 +36,12 @@ export function GeneratedImageDisplay({
   selectedProduct,
   generatedImageBase64,
   generationPrompt,
+  colorScheme,
+  designStyle,
 }: GeneratedImageDisplayProps) {
   const generateImageMutation = useGenerateImage();
   const [imageError, setImageError] = useState(false);
+  const [showFurniturePanel, setShowFurniturePanel] = useState(false);
 
   const handleGenerateImage = () => {
     generateImageMutation.mutate(projectId, {
@@ -59,7 +76,7 @@ export function GeneratedImageDisplay({
                 )}&w=64&h=64&fit=cover`;
               }}
             />
-            <div>
+            <div className="flex-1">
               <p className="font-medium text-gray-900 dark:text-white">
                 {selectedProduct.title}
               </p>
@@ -69,6 +86,60 @@ export function GeneratedImageDisplay({
               </p>
             </div>
           </div>
+
+          {/* Color Scheme Display */}
+          {colorScheme && (
+            <div className="mt-4 pt-4 border-t border-gray-200 dark:border-gray-600">
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-sm font-medium text-gray-700 dark:text-gray-300">
+                    Color Scheme:
+                  </p>
+                  <p className="text-sm text-gray-900 dark:text-white font-semibold">
+                    {colorScheme.keep_original ? "Original Colors" : colorScheme.palette_name}
+                  </p>
+                </div>
+                {!colorScheme.keep_original && colorScheme.colors && colorScheme.colors.length > 0 && (
+                  <div className="flex gap-1">
+                    {colorScheme.colors.slice(0, 5).map((color, idx) => (
+                      <div
+                        key={idx}
+                        className="w-8 h-8 rounded-md border-2 border-white dark:border-gray-600 shadow-sm"
+                        style={{ backgroundColor: color }}
+                        title={color}
+                      />
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Design Style Display */}
+          {designStyle && (
+            <div className="mt-4 pt-4 border-t border-gray-200 dark:border-gray-600">
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-sm font-medium text-gray-700 dark:text-gray-300">
+                    Design Style:
+                  </p>
+                  <p className="text-sm text-gray-900 dark:text-white font-semibold">
+                    {designStyle.keep_original ? "Original Style" : designStyle.style_name}
+                  </p>
+                </div>
+                {!designStyle.keep_original && (
+                  <div className="text-2xl">
+                    {designStyle.style_name === "Bohemian" && "🌿"}
+                    {designStyle.style_name === "Scandinavian" && "❄️"}
+                    {designStyle.style_name === "Contemporary" && "🏢"}
+                    {designStyle.style_name === "Coastal" && "🌊"}
+                    {designStyle.style_name === "Modern" && "⚡"}
+                    {designStyle.style_name === "Art Deco" && "💎"}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
         </div>
 
         {generationPrompt && (
@@ -201,6 +272,36 @@ export function GeneratedImageDisplay({
           </div>
         </div>
       </div>
+
+      {/* AI Furniture Identification Button */}
+      <div className="mt-6 p-4 bg-gradient-to-r from-purple-50 to-indigo-50 dark:from-purple-900/20 dark:to-indigo-900/20 rounded-lg">
+        <div className="flex items-center justify-between">
+          <div className="flex-1">
+            <h4 className="font-semibold text-gray-900 dark:text-white mb-1">
+              🔍 Identify Furniture with AI
+            </h4>
+            <p className="text-sm text-gray-600 dark:text-gray-400">
+              Click to mark and identify multiple furniture items in the visualization
+            </p>
+          </div>
+          <button
+            onClick={() => setShowFurniturePanel(true)}
+            className="px-6 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 font-medium"
+          >
+            Identify Furniture
+          </button>
+        </div>
+      </div>
+
+      {/* Furniture Identification Panel */}
+      {showFurniturePanel && generatedImageBase64 && (
+        <FurnitureIdentificationPanel
+          projectId={projectId}
+          imageBase64={generatedImageBase64}
+          imageType="product"
+          onClose={() => setShowFurniturePanel(false)}
+        />
+      )}
 
       {generationPrompt && (
         <div className="mt-6 bg-blue-50 dark:bg-blue-900/20 rounded-lg p-4">

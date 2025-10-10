@@ -12,6 +12,7 @@ from models import (
     ImageUploadResponse,
     ImprovementMarkersRequest,
     ImprovementMarkersResponse,
+    InspirationImageGenerationResponse,
     InspirationImagesBatchUploadResponse,
     InspirationImageUploadResponse,
     InspirationRecommendationsResponse,
@@ -29,6 +30,14 @@ from models import (
     ProjectSummary,
     SpaceTypeRequest,
     SpaceTypeResponse,
+    ClipSearchRequest,
+    ClipSearchResponse,
+    ClipAnalysisInfo,
+    BatchFurnitureAnalysisRequest,
+    BatchFurnitureAnalysisResponse,
+    FurnitureAnalysisItem,
+    ReverseSearchBatchRequest,
+    ReverseSearchBatchResponse,
 )
 
 load_dotenv()
@@ -381,6 +390,89 @@ async def generate_inspiration_recommendations(project_id: str):
 
 
 @app.post(
+    "/projects/{project_id}/inspiration-redesign",
+    response_model=InspirationImageGenerationResponse,
+)
+async def generate_inspiration_redesign(project_id: str):
+    """Generate a redesigned room image based on inspiration recommendations"""
+    logger.info(
+        "API request: generate inspiration redesign",
+        extra={"project_id": project_id},
+    )
+    project = data_manager.get_project(project_id)
+
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    # Check if project has inspiration recommendations (regardless of status)
+    context = ProjectContext.model_validate(project["context"])
+    has_inspiration_recs = (
+        context.inspiration_recommendations 
+        and len(context.inspiration_recommendations) > 0
+    )
+    
+    if not has_inspiration_recs:
+        logger.warning(
+            "Project has no inspiration recommendations",
+            extra={
+                "project_id": project_id,
+                "current_status": project["status"],
+                "has_inspiration_recs": False,
+            },
+        )
+        raise HTTPException(
+            status_code=400,
+            detail="Project must have inspiration recommendations first. Upload inspiration images and generate recommendations.",
+        )
+
+    try:
+        logger.info(
+            "Starting inspiration redesign",
+            extra={
+                "project_id": project_id,
+                "current_status": project["status"],
+            },
+        )
+        result = data_manager.generate_inspiration_redesign(project_id)
+
+        logger.info(
+            "Inspiration redesign generated successfully",
+            extra={
+                "project_id": project_id,
+                "image_len": len(result.get("generated_image_base64", "")),
+            },
+        )
+        return InspirationImageGenerationResponse(
+            project_id=project_id,
+            generated_image_base64=result["generated_image_base64"],
+            inspiration_prompt=result["inspiration_prompt"],
+            inspiration_recommendations=result["inspiration_recommendations"],
+            status=result["status"],
+            message=result["message"],
+        )
+    except ValueError as e:
+        logger.error(
+            "Inspiration redesign failed: ValueError",
+            extra={"project_id": project_id, "error": str(e)},
+        )
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        import traceback
+        logger.error(
+            "Inspiration redesign failed: Unexpected error",
+            extra={
+                "project_id": project_id,
+                "error": str(e),
+                "trace": traceback.format_exc(),
+            },
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to generate inspiration redesign: {str(e)}",
+        )
+
+
+@app.post(
     "/projects/{project_id}/product-recommendations",
     response_model=ProductRecommendationsResponse,
 )
@@ -533,11 +625,8 @@ async def select_product_for_generation(
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    if project["status"] != "PRODUCT_SEARCH_COMPLETE":
-        raise HTTPException(
-            status_code=400,
-            detail="Project must have completed product search first",
-        )
+    # Do not hard-block on project status here; the data manager will validate
+    # that the context is ready for product selection (has search results, etc.).
 
     try:
         selected = data_manager.select_product_for_generation(
@@ -546,6 +635,8 @@ async def select_product_for_generation(
             selection_request.product_title,
             selection_request.product_image_url,
             selection_request.generation_prompt,
+            selection_request.color_scheme,
+            selection_request.design_style,
         )
 
         return ProductSelectionResponse(
@@ -591,7 +682,7 @@ async def generate_product_visualization(project_id: str):
         return ImageGenerationResponse(
             project_id=project_id,
             selected_product=generation_result["selected_product"],
-            generated_image_url=generation_result["generated_image_url"],
+            generated_image_base64=generation_result["generated_image_base64"],
             generation_prompt=generation_result["generation_prompt"],
             status="success",
             message=generation_result["message"],
@@ -628,6 +719,138 @@ async def get_generated_image(project_id: str):
         media_type="image/png",
         filename=f"generated_visualization_{project_id}.png",
     )
+
+
+@app.post(
+    "/projects/{project_id}/clip-search",
+    response_model=ClipSearchResponse,
+)
+async def clip_search_products(project_id: str, req: ClipSearchRequest):
+    """Perform a product search based on a clipped region of the generated image."""
+    project = data_manager.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    try:
+        search_result = data_manager.clip_search_products(
+            project_id, 
+            req.rect,
+            use_inspiration_image=req.use_inspiration_image or False
+        )
+        
+        # Construct CLIP analysis info if available
+        clip_analysis_info = None
+        if "clip_analysis" in search_result and search_result["clip_analysis"]:
+            clip_analysis_info = ClipAnalysisInfo(**search_result["clip_analysis"])
+        
+        return ClipSearchResponse(
+            project_id=project_id,
+            rect=req.rect,
+            search_query=search_result["search_query"],
+            products=search_result["products"],
+            total_found=search_result["total_found"],
+            status="success",
+            message=f"Found {search_result['total_found']} products for clipped region",
+            analysis_method=search_result.get("analysis_method", "vision"),
+            clip_analysis=clip_analysis_info,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed clip-search: {str(e)}")
+
+
+@app.post(
+    "/projects/{project_id}/analyze-furniture-batch",
+    response_model=BatchFurnitureAnalysisResponse,
+)
+async def analyze_furniture_batch(project_id: str, req: BatchFurnitureAnalysisRequest):
+    """Analyze multiple furniture items in a batch using CLIP and AI."""
+    project = data_manager.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    try:
+        # Call data manager to analyze all selections
+        analysis_results = data_manager.analyze_furniture_batch(
+            project_id,
+            req.selections,
+            image_type=req.image_type
+        )
+        
+        return BatchFurnitureAnalysisResponse(
+            project_id=project_id,
+            selections=analysis_results["selections"],
+            overall_analysis=analysis_results.get("overall_analysis", ""),
+            total_items=len(analysis_results["selections"]),
+            status="success",
+            message=f"Analyzed {len(analysis_results['selections'])} furniture items"
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Failed to analyze furniture batch: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to analyze furniture: {str(e)}")
+
+
+@app.post(
+    "/projects/{project_id}/reverse-search-batch",
+    response_model=ReverseSearchBatchResponse,
+)
+async def reverse_search_batch(project_id: str, req: ReverseSearchBatchRequest):
+    """Perform Google Lens reverse image search on multiple selections."""
+    project = data_manager.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    try:
+        result = data_manager.reverse_search_batch(
+            project_id,
+            req.selections,
+            image_type=req.image_type,
+        )
+        return ReverseSearchBatchResponse(
+            project_id=project_id,
+            results=result["results"],
+            total_items=len(result["results"]),
+            status="success",
+            message=f"Reverse searched {len(result['results'])} items",
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Failed reverse-search-batch: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed reverse-search: {str(e)}")
+
+
+@app.get("/projects/{project_id}/auto-detect")
+async def auto_detect(project_id: str, image_type: str = "product"):
+    """Auto-detect furniture objects (YOLO if available)."""
+    project = data_manager.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    try:
+        result = data_manager.auto_detect_furniture(project_id, image_type=image_type)
+        return {"project_id": project_id, **result}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Auto-detect failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Auto-detect failed: {str(e)}")
+
+
+@app.get("/projects/{project_id}/replicate-segment")
+async def replicate_segment(project_id: str, image_type: str = "product", image_url: str | None = None):
+    """Segment with Replicate (Mask2Former). If image_url is None, fallback to YOLO."""
+    try:
+        result = data_manager.replicate_segment(project_id, image_type=image_type, public_image_url=image_url)
+        return {"project_id": project_id, **result}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Replicate segment failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Replicate segment failed: {str(e)}")
 
 
 if __name__ == "__main__":

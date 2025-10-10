@@ -5,6 +5,7 @@ import { ImageMarkerInterface } from "@/components/ImageMarkerInterface";
 import { ImageUploadSection } from "@/components/ImageUploadSection";
 import { InspirationImageUpload } from "@/components/InspirationImageUpload";
 import { InspirationRecommendations } from "@/components/InspirationRecommendations";
+import { InspirationRedesignDisplay } from "@/components/InspirationRedesignDisplay";
 import { LabelledImageDisplay } from "@/components/LabelledImageDisplay";
 import { MarkerRecommendations } from "@/components/MarkerRecommendations";
 import { ProductRecommendations } from "@/components/ProductRecommendations";
@@ -37,6 +38,7 @@ export default function ProjectPage() {
       "PRODUCT_SEARCH_COMPLETE",
       "PRODUCT_SELECTED",
       "IMAGE_GENERATED",
+      "INSPIRATION_REDESIGN_COMPLETE",
     ];
 
     const targetIndex = statusOrder.indexOf(targetStatus);
@@ -239,8 +241,31 @@ export default function ProjectPage() {
                     : undefined
                 }
                 generationPrompt={project.context.generation_prompt}
+                colorScheme={project.context.color_scheme}
+                designStyle={project.context.design_style}
               />
             )}
+
+          {/* Inspiration-based Redesign Section */}
+          {hasReachedStatus(
+            "INSPIRATION_RECOMMENDATIONS_READY",
+            project.status
+          ) && (
+            <InspirationRedesignDisplay
+              projectId={project.project_id}
+              generatedImageBase64={
+                project.status === "INSPIRATION_REDESIGN_COMPLETE"
+                  ? project.context.inspiration_generated_image_base64
+                  : undefined
+              }
+              inspirationPrompt={
+                project.context.inspiration_generation_prompt
+              }
+              hasRecommendations={
+                (project.context.inspiration_recommendations || []).length > 0
+              }
+            />
+          )}
 
           {/* Project Completion */}
           {project.status === "IMAGE_GENERATED" && (

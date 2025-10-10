@@ -3,6 +3,54 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
 
+class ColorPalette(BaseModel):
+    """
+    Model for color palette selection
+    """
+    name: str
+    colors: List[str]  # List of hex color codes
+    description: Optional[str] = None
+
+
+class ColorSchemeRequest(BaseModel):
+    """
+    Request model for setting color scheme for a project
+    """
+    project_id: str
+    palette_name: str
+    colors: List[str]  # List of hex color codes
+    keep_original: bool = False  # If true, use original image colors
+
+
+class StyleOption(BaseModel):
+    """
+    Model for design style selection
+    """
+    name: str
+    description: Optional[str] = None
+    image_url: Optional[str] = None  # Preview image for the style
+
+
+class StyleSelectionRequest(BaseModel):
+    """
+    Request model for setting design style for a project
+    """
+    project_id: str
+    style_name: str
+    keep_original: bool = False  # If true, maintain original room style
+
+
+class GenerateWithProductRequest(BaseModel):
+    """
+    Request model for generating image with product and color scheme
+    """
+    project_id: str
+    product_url: str
+    product_title: str
+    color_scheme: Optional[ColorSchemeRequest] = None
+    use_original_colors: bool = False
+
+
 class ProjectCreateResponse(BaseModel):
     """
     Response model for project creation endpoint.
@@ -202,6 +250,20 @@ class ProjectContext(BaseModel):
     generation_prompt: Optional[str] = Field(
         default=None, description="The prompt used for Gemini image generation"
     )
+    color_scheme: Optional[Dict[str, Any]] = Field(
+        default=None, description="Selected color scheme for image generation"
+    )
+    design_style: Optional[Dict[str, Any]] = Field(
+        default=None, description="Selected design style for image generation"
+    )
+    
+    # Inspiration-based image generation
+    inspiration_generated_image_base64: Optional[str] = Field(
+        default=None, description="Base64 encoded inspiration-redesigned image"
+    )
+    inspiration_generation_prompt: Optional[str] = Field(
+        default=None, description="The prompt used for inspiration-based generation"
+    )
 
     def is_ready_for_markers(self) -> bool:
         """Check if ready for marker placement."""
@@ -255,6 +317,14 @@ class ProjectContext(BaseModel):
         """Check if ready for Gemini image generation."""
         return (
             self.is_ready_for_product_selection() and self.selected_product is not None
+        )
+    
+    def is_ready_for_inspiration_redesign(self) -> bool:
+        """Check if ready for inspiration-based image redesign."""
+        return (
+            self.base_image is not None
+            and self.space_type is not None
+            and len(self.inspiration_recommendations) > 0
         )
 
 
@@ -441,12 +511,16 @@ class ProductSelectionRequest(BaseModel):
         product_title (str): Title of the selected product
         product_image_url (str): Image URL of the selected product
         generation_prompt (str): Custom prompt for image generation (optional)
+        color_scheme (dict): Color scheme selection (optional)
+        design_style (dict): Design style selection (optional)
     """
 
     product_url: str
     product_title: str
     product_image_url: str
     generation_prompt: Optional[str] = None
+    color_scheme: Optional[Dict[str, Any]] = None
+    design_style: Optional[Dict[str, Any]] = None
 
 
 class ProductSelectionResponse(BaseModel):
@@ -485,3 +559,162 @@ class ImageGenerationResponse(BaseModel):
     generation_prompt: str
     status: str
     message: str = "Image generation completed successfully"
+
+
+class InspirationImageGenerationResponse(BaseModel):
+    """
+    Response model for inspiration-based image redesign.
+
+    Attributes:
+        project_id (str): The unique identifier for the project
+        generated_image_base64 (str): Base64 encoded redesigned image
+        inspiration_prompt (str): The prompt used for inspiration-based generation
+        inspiration_recommendations (List[str]): The inspiration recommendations used
+        status (str): Status of the generation operation
+        message (str): Human-readable message about the result
+    """
+
+    project_id: str
+    generated_image_base64: str
+    inspiration_prompt: str
+    inspiration_recommendations: List[str]
+    status: str
+    message: str = "Inspiration-based image redesign completed successfully"
+
+
+class ClipRect(BaseModel):
+    """
+    Normalized rectangle describing a selection on an image.
+
+    Coordinates are normalized to the image dimensions (0-1 range).
+    """
+
+    x: float = Field(..., ge=0.0, le=1.0, description="Top-left X (0-1)")
+    y: float = Field(..., ge=0.0, le=1.0, description="Top-left Y (0-1)")
+    width: float = Field(..., ge=0.0, le=1.0, description="Width (0-1)")
+    height: float = Field(..., ge=0.0, le=1.0, description="Height (0-1)")
+
+
+class ClipSearchRequest(BaseModel):
+    """
+    Request model for clip-based product search on the generated image.
+    """
+
+    rect: ClipRect
+    use_inspiration_image: Optional[bool] = Field(
+        default=False,
+        description="If true, use inspiration redesign image instead of product visualization"
+    )
+
+
+class ClipAnalysisInfo(BaseModel):
+    """
+    CLIP analysis information for a searched region.
+    """
+    furniture_type: Optional[str] = None
+    furniture_confidence: Optional[float] = None
+    style: Optional[str] = None
+    material: Optional[str] = None
+    color: Optional[str] = None
+
+
+class FurnitureSelection(BaseModel):
+    """
+    Represents a single furniture selection on an image.
+    """
+    id: str
+    x: float = Field(..., ge=0.0, le=1.0, description="X coordinate (0-1 range)")
+    y: float = Field(..., ge=0.0, le=1.0, description="Y coordinate (0-1 range)")
+    label: Optional[str] = None
+
+
+class BatchFurnitureAnalysisRequest(BaseModel):
+    """
+    Request model for batch furniture analysis.
+    """
+    selections: List[FurnitureSelection]
+    image_type: str = Field(
+        default="product", 
+        description="Type of image: 'product' or 'inspiration'"
+    )
+
+
+class FurnitureAnalysisItem(BaseModel):
+    """
+    Analysis result for a single furniture item.
+    """
+    id: str
+    furniture_type: str
+    confidence: float
+    style: str
+    material: str
+    color: str
+    search_query: str
+    products: List[Dict[str, Any]]
+
+
+class BatchFurnitureAnalysisResponse(BaseModel):
+    """
+    Response model for batch furniture analysis.
+    """
+    project_id: str
+    selections: List[FurnitureAnalysisItem]
+    overall_analysis: str
+    total_items: int
+    status: str
+    message: str
+
+
+class ReverseSearchBatchRequest(BaseModel):
+    """
+    Request model for reverse image search on multiple selections.
+    """
+    selections: List[FurnitureSelection]
+    image_type: str = Field(
+        default="product",
+        description="Type of image: 'product' or 'inspiration'",
+    )
+
+
+class ReverseSearchMatch(BaseModel):
+    """
+    A single match returned by Google Lens via SerpAPI.
+    """
+    title: Optional[str] = None
+    url: Optional[str] = None
+    source: Optional[str] = None
+    thumbnail: Optional[str] = None
+
+
+class ReverseSearchItemResult(BaseModel):
+    id: str
+    image_url: Optional[str] = None
+    matches: List[ReverseSearchMatch]
+
+
+class ReverseSearchBatchResponse(BaseModel):
+    project_id: str
+    results: List[ReverseSearchItemResult]
+    total_items: int
+    status: str
+    message: str
+
+
+class ClipSearchResponse(BaseModel):
+    """
+    Response model for clip-based product search results.
+    """
+
+    project_id: str
+    rect: ClipRect
+    search_query: str
+    products: List[Dict[str, Any]]
+    total_found: int
+    status: str
+    message: str
+    analysis_method: Optional[str] = Field(
+        default="vision", description="Method used for analysis: 'clip' or 'vision'"
+    )
+    clip_analysis: Optional[ClipAnalysisInfo] = Field(
+        default=None, description="CLIP-based analysis results if available"
+    )
