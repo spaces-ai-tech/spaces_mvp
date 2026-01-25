@@ -11,6 +11,8 @@ from urllib.parse import urlparse
 from dotenv import load_dotenv
 from exa_py import Exa
 
+from cache_manager import cache_manager
+
 load_dotenv()
 
 
@@ -37,12 +39,22 @@ class ExaClient:
         similar_per_seed: int = 3,
     ) -> Dict[str, Any]:
         """
-        Search for furniture products using Exa search + contents, and expand with similar links.
+        Search for furniture products using Exa search + contents, and expand with similar links (with caching).
 
         Returns:
             Dict with results compatible with downstream parsing.
         """
+        # Check cache first
+        cached = cache_manager.get_product_search(
+            "exa", query, num_results,
+            extra_params={"similar_per_seed": similar_per_seed}
+        )
+        if cached is not None:
+            print(f"🔍 EXA: 💾 Cache HIT for query: '{query[:40]}...'")
+            return {"results": cached}
+
         trusted_domains = [
+            # Original quality furniture retailers
             "wayfair.com",
             "westelm.com",
             "cb2.com",
@@ -50,17 +62,37 @@ class ExaClient:
             "potterybarn.com",
             "article.com",
             "ikea.com",
+            "allmodern.com",
+            "overstock.com",
+            # Art & Wall Decor Specialists
+            "drool.com",
+            "olivergal.com",
+            "art.com",
+            "minted.com",
+            "society6.com",
+            "icanvas.com",
+            "saatchiart.com",
+            # Premium Curated
+            "anthropologie.com",
+            "urbanoutfitters.com",
+            "designwithinreach.com",
+            "roomandboard.com",
+            "serenaandlily.com",
+            "rejuvenation.com",
+            "burkedecor.com",
+            "lumens.com",
+            # Specialty
+            "etsy.com",
+            "1stdibs.com",
+            "chairish.com",
+            "worldmarket.com",
+            "zgallerie.com",
+            # General with good selection
             "amazon.com",
             "target.com",
             "homedepot.com",
             "walmart.com",
-            "overstock.com",
-            "allmodern.com",
-            "ashleyfurniture.com",
-            "roomstogo.com",
-            "livingspaces.com",
-            "pier1.com",
-            "homegoods.com",
+            "houzz.com",
         ]
 
         try:
@@ -69,7 +101,6 @@ class ExaClient:
             base_result = self.exa.search(
                 query=query,
                 num_results=num_results,
-                use_autoprompt=True,
                 type="keyword",
                 include_domains=trusted_domains,
             )
@@ -159,6 +190,15 @@ class ExaClient:
                 )
 
             print(f"🔍 EXA: converted {len(converted_results['results'])} results")
+
+            # Cache successful results
+            if converted_results.get("results"):
+                cache_manager.set_product_search(
+                    "exa", query, num_results,
+                    converted_results["results"],
+                    extra_params={"similar_per_seed": similar_per_seed}
+                )
+
             return converted_results
 
         except Exception as e:
@@ -662,3 +702,170 @@ class ExaClient:
             return False
 
         return True
+
+    # =========================================================================
+    # Google Shopping URL Resolution
+    # =========================================================================
+
+    def is_google_shopping_url(self, url: str) -> bool:
+        """Check if URL is a Google Shopping redirect URL."""
+        patterns = [
+            "google.com/shopping",
+            "google.com/url?",
+            "shopping.google.com",
+            "google.com/aclk",
+        ]
+        url_lower = url.lower()
+        return any(p in url_lower for p in patterns)
+
+    def resolve_google_shopping_url(self, google_shopping_url: str) -> Optional[str]:
+        """
+        Resolve a Google Shopping URL to the actual retailer URL.
+        Uses Exa's get_contents to fetch the page and extract the retailer link.
+        """
+        try:
+            print(f"🔍 EXA: Resolving Google Shopping URL: {google_shopping_url[:60]}...")
+
+            contents = self.exa.get_contents(
+                urls=[google_shopping_url],
+                text={"max_characters": 8000, "include_html_tags": True}
+            )
+
+            if not contents or not contents.results:
+                print(f"⚠️ EXA: No content returned for Google Shopping URL")
+                return None
+
+            html_content = getattr(contents.results[0], "text", "") or ""
+            resolved = self._extract_retailer_from_google_shopping(html_content, google_shopping_url)
+
+            if resolved:
+                print(f"✅ EXA: Resolved to retailer URL: {resolved[:60]}...")
+            else:
+                print(f"⚠️ EXA: Could not extract retailer URL from content")
+
+            return resolved
+
+        except Exception as e:
+            print(f"❌ EXA: Failed to resolve Google Shopping URL: {e}")
+            return None
+
+    def _extract_retailer_from_google_shopping(
+        self, html_content: str, original_url: str
+    ) -> Optional[str]:
+        """Extract the actual retailer URL from Google Shopping page HTML."""
+        from urllib.parse import unquote, urlparse, parse_qs
+
+        # First, try to extract from the original URL if it contains redirect params
+        try:
+            parsed = urlparse(original_url)
+            query_params = parse_qs(parsed.query)
+
+            # Check common redirect parameters
+            for param in ["url", "q", "adurl", "dest"]:
+                if param in query_params:
+                    candidate = unquote(query_params[param][0])
+                    if candidate.startswith("http") and "google.com" not in candidate.lower():
+                        return candidate
+        except Exception:
+            pass
+
+        # Patterns to extract retailer URLs from HTML content
+        patterns = [
+            # Visit site/store links
+            r'href="(https?://(?!.*google\.com)[^"]+)"[^>]*>[^<]*(?:Visit|Shop|Buy|View)[^<]*(?:site|store|now|product)',
+            # Data attributes with merchant URLs
+            r'data-merchant-url="([^"]+)"',
+            r'data-url="(https?://(?!.*google\.com)[^"]+)"',
+            r'data-href="(https?://(?!.*google\.com)[^"]+)"',
+            # JSON-LD structured data
+            r'"url"\s*:\s*"(https?://(?!.*google\.com)[^"]+)"',
+            r'"offers"[^}]*"url"\s*:\s*"(https?://[^"]+)"',
+            # Direct product links
+            r'href="(https?://(?:www\.)?(?:amazon|wayfair|ikea|target|walmart|homedepot|lowes|westelm|cb2|potterybarn|crateandbarrel|overstock|allmodern|article)\.[^"]+)"',
+        ]
+
+        for pattern in patterns:
+            matches = re.findall(pattern, html_content, re.IGNORECASE)
+            if matches:
+                candidate = unquote(matches[0])
+                # Validate it's a real retailer URL
+                if self._is_valid_retailer_url(candidate):
+                    return candidate
+
+        return None
+
+    def _is_valid_retailer_url(self, url: str) -> bool:
+        """Check if a URL is a valid retailer product URL."""
+        if not url or not url.startswith("http"):
+            return False
+
+        url_lower = url.lower()
+
+        # Exclude Google URLs
+        if "google.com" in url_lower:
+            return False
+
+        # Exclude common non-product URLs
+        exclude_patterns = [
+            "/search", "/results", "/browse", "/category",
+            "javascript:", "mailto:", "#"
+        ]
+        if any(p in url_lower for p in exclude_patterns):
+            return False
+
+        return True
+
+    def resolve_urls_batch(
+        self,
+        urls: List[str],
+        resolve_google_shopping: bool = True
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        Batch resolve URLs - identifies and resolves Google Shopping URLs.
+
+        Args:
+            urls: List of product URLs to process
+            resolve_google_shopping: Whether to resolve Google Shopping URLs
+
+        Returns:
+            Dict mapping original URL -> {
+                "resolved_url": str or None,
+                "is_google_shopping": bool,
+                "resolution_success": bool
+            }
+        """
+        results = {}
+        google_shopping_urls = []
+
+        for url in urls:
+            if self.is_google_shopping_url(url):
+                google_shopping_urls.append(url)
+                results[url] = {
+                    "is_google_shopping": True,
+                    "resolved_url": None,
+                    "resolution_success": False
+                }
+            else:
+                results[url] = {
+                    "is_google_shopping": False,
+                    "resolved_url": url,
+                    "resolution_success": True
+                }
+
+        # Resolve Google Shopping URLs
+        if resolve_google_shopping and google_shopping_urls:
+            print(f"🔍 EXA: Resolving {len(google_shopping_urls)} Google Shopping URL(s)...")
+
+            for gs_url in google_shopping_urls:
+                resolved = self.resolve_google_shopping_url(gs_url)
+                if resolved:
+                    results[gs_url]["resolved_url"] = resolved
+                    results[gs_url]["resolution_success"] = True
+                else:
+                    # Fall back to original URL if resolution fails
+                    results[gs_url]["resolved_url"] = gs_url
+
+        resolved_count = sum(1 for r in results.values() if r.get("resolution_success"))
+        print(f"🔍 EXA: Resolved {resolved_count}/{len(urls)} URLs successfully")
+
+        return results

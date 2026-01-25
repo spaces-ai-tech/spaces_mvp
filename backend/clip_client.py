@@ -24,22 +24,35 @@ except ImportError:
 
 class CLIPClient:
     """Client for CLIP-based image analysis and similarity matching"""
-    
-    def __init__(self, model_name: str = "openai/clip-vit-base-patch32"):
+
+    def __init__(self, model_name: str = None):
         """
         Initialize CLIP client with specified model
-        
+
         Args:
-            model_name: HuggingFace model identifier for CLIP
+            model_name: HuggingFace model identifier for CLIP. If None, uses
+                       feature flag to select between base and large models.
         """
         self.logger = logging.getLogger("spaces_ai.clip")
-        
+
         if not CLIP_AVAILABLE:
             self.logger.error("CLIP dependencies not available")
             self.model = None
             self.processor = None
             return
-        
+
+        # Select model based on feature flag if not explicitly provided
+        if model_name is None:
+            try:
+                from config import FeatureFlags
+                if FeatureFlags.USE_CLIP_LARGE:
+                    model_name = "openai/clip-vit-large-patch14"
+                else:
+                    model_name = "openai/clip-vit-base-patch32"
+            except ImportError:
+                # Fallback to base model if config not available
+                model_name = "openai/clip-vit-base-patch32"
+
         try:
             self.logger.info(f"Loading CLIP model: {model_name}")
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -171,31 +184,39 @@ class CLIPClient:
             image_embedding = self.encode_image(image_input)
             if image_embedding is None:
                 return {"error": "Failed to encode image"}
-            
-            # Furniture categories to check
-            furniture_types = [
-                "sofa", "chair", "table", "lamp", "cabinet", "bed", 
-                "desk", "shelf", "dresser", "couch", "ottoman", "bench",
-                "coffee table", "dining table", "side table", "nightstand"
-            ]
-            
-            # Style attributes to check
-            styles = [
-                "modern", "contemporary", "traditional", "rustic", "industrial",
-                "minimalist", "mid-century", "scandinavian", "vintage", "bohemian"
-            ]
-            
-            # Material attributes
-            materials = [
-                "wood", "wooden", "leather", "fabric", "metal", "glass",
-                "velvet", "linen", "rattan", "marble", "concrete"
-            ]
-            
-            # Color attributes
-            colors = [
-                "white", "black", "gray", "brown", "beige", "blue",
-                "green", "navy", "cream", "tan", "natural"
-            ]
+
+            # Check feature flag for vocabulary selection
+            try:
+                from config import FeatureFlags, FURNITURE_TYPES_EXPANDED, STYLES_EXPANDED, MATERIALS_EXPANDED, COLORS_EXPANDED
+                use_expanded = FeatureFlags.EXPANDED_VOCABULARY
+            except ImportError:
+                use_expanded = False
+
+            if use_expanded:
+                # Expanded vocabulary for better matching accuracy
+                furniture_types = FURNITURE_TYPES_EXPANDED
+                styles = STYLES_EXPANDED
+                materials = MATERIALS_EXPANDED
+                colors = COLORS_EXPANDED
+            else:
+                # Original vocabulary (fallback)
+                furniture_types = [
+                    "sofa", "chair", "table", "lamp", "cabinet", "bed",
+                    "desk", "shelf", "dresser", "couch", "ottoman", "bench",
+                    "coffee table", "dining table", "side table", "nightstand"
+                ]
+                styles = [
+                    "modern", "contemporary", "traditional", "rustic", "industrial",
+                    "minimalist", "mid-century", "scandinavian", "vintage", "bohemian"
+                ]
+                materials = [
+                    "wood", "wooden", "leather", "fabric", "metal", "glass",
+                    "velvet", "linen", "rattan", "marble", "concrete"
+                ]
+                colors = [
+                    "white", "black", "gray", "brown", "beige", "blue",
+                    "green", "navy", "cream", "tan", "natural"
+                ]
             
             # Score each category
             def score_categories(categories: List[str]) -> List[Tuple[str, float]]:
@@ -407,7 +428,7 @@ class CLIPClient:
             self.logger.error(f"Failed to generate enhanced query: {e}")
             return "furniture"
 
-    def validate_products_by_label(self, label: str, products: List[Dict[str, Any]], threshold: float = 0.18, top_k: int = 10) -> List[Dict[str, Any]]:
+    def validate_products_by_label(self, label: str, products: List[Dict[str, Any]], threshold: float = 0.40, top_k: int = 10) -> List[Dict[str, Any]]:
         """
         Validate and re-rank candidate products against a text label using CLIP.
         
@@ -476,4 +497,88 @@ class CLIPClient:
         except Exception:
             pass
         return None
+
+    def rerank_products_by_visual_similarity(
+        self,
+        query_image: Image.Image,
+        products: List[Dict[str, Any]],
+        top_k: int = 12,
+        min_similarity: float = 0.3
+    ) -> List[Dict[str, Any]]:
+        """Re-rank products by image-to-image visual similarity to the query image.
+
+        This provides more accurate matching than text-to-image similarity for
+        finding visually similar products.
+
+        Args:
+            query_image: PIL Image of the furniture crop
+            products: List of product dicts with thumbnail/image_url
+            top_k: Maximum number of products to return
+            min_similarity: Minimum similarity threshold (0-1)
+
+        Returns:
+            Products sorted by visual_similarity descending
+        """
+        if not self.is_available():
+            return products[:top_k]
+
+        try:
+            # Encode query image
+            query_embedding = self.encode_image(query_image)
+            if query_embedding is None:
+                self.logger.warning("Failed to encode query image")
+                return products[:top_k]
+
+            scored_products = []
+            for product in products:
+                # Get best available image URL
+                img_url = (
+                    product.get("thumbnail") or
+                    product.get("image_url") or
+                    (product.get("images") or [None])[0]
+                )
+
+                if not img_url:
+                    product["visual_similarity"] = 0.0
+                    scored_products.append(product)
+                    continue
+
+                try:
+                    product_image = self._download_image_from_url(img_url)
+                    if product_image:
+                        product_embedding = self.encode_image(product_image)
+                        if product_embedding is not None:
+                            similarity = self.compute_similarity(query_embedding, product_embedding)
+                            product["visual_similarity"] = float(similarity)
+                        else:
+                            product["visual_similarity"] = 0.0
+                    else:
+                        product["visual_similarity"] = 0.0
+                except Exception as e:
+                    self.logger.debug(f"Error scoring product: {e}")
+                    product["visual_similarity"] = 0.0
+
+                scored_products.append(product)
+
+            # Sort by visual similarity descending
+            scored_products.sort(key=lambda p: p.get("visual_similarity", 0), reverse=True)
+
+            # Filter by minimum similarity if specified
+            if min_similarity > 0:
+                scored_products = [
+                    p for p in scored_products
+                    if p.get("visual_similarity", 0) >= min_similarity or
+                    p.get("match_type") == "exact"  # Keep exact matches regardless
+                ]
+
+            # Log top matches for debugging
+            top_3 = scored_products[:3]
+            if top_3:
+                self.logger.info(f"Top visual matches: {[(p.get('title', 'N/A')[:30], p.get('visual_similarity', 0)) for p in top_3]}")
+
+            return scored_products[:top_k]
+
+        except Exception as e:
+            self.logger.error(f"Visual similarity reranking failed: {e}")
+            return products[:top_k]
 

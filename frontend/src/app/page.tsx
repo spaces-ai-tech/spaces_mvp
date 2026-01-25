@@ -11,45 +11,58 @@ export default function Home() {
   const router = useRouter();
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 dark:from-gray-900 dark:to-gray-800">
-      <div className="container mx-auto px-4 py-8">
-        <header className="text-center mb-12">
-          <h1 className="text-4xl font-bold text-gray-900 dark:text-white mb-4">
-            AI Interior Design Agent
-          </h1>
-          <p className="text-lg text-gray-600 dark:text-gray-300">
-            Intelligent design recommendations for your space
-          </p>
-          
-          {/* Quick Links */}
-          <div className="mt-6 flex justify-center gap-4">
+    <div className="min-h-screen bg-gradient-to-br from-slate-50 to-slate-100 dark:from-gray-900 dark:to-gray-800">
+      {/* Sticky Top Bar */}
+      <header className="sticky top-0 z-50 h-[60px] bg-white/80 dark:bg-gray-900/80 backdrop-blur-md border-b border-slate-200 dark:border-gray-700">
+        <div className="container mx-auto px-5 h-full flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <span className="text-xl font-extrabold text-gray-900 dark:text-white tracking-tight">
+              Spaces<span className="text-rose-500">.</span>
+            </span>
+          </div>
+          <div className="flex items-center gap-4">
             <a
               href="/affiliate-cart"
-              className="inline-flex items-center px-6 py-3 bg-green-600 text-white rounded-lg font-medium hover:bg-green-700 transition-colors shadow-md"
+              className="text-sm text-gray-600 dark:text-gray-300 hover:text-gray-900 dark:hover:text-white transition-colors"
             >
-              🛒 Affiliate Cart Generator
+              Cart
             </a>
+            <div className="w-8 h-8 rounded-full bg-gradient-to-br from-rose-400 to-purple-500 flex items-center justify-center text-white text-sm font-medium">
+              U
+            </div>
           </div>
-        </header>
+        </div>
+      </header>
 
-        <main className="max-w-4xl mx-auto">
-          <div className="grid md:grid-cols-2 gap-6">
+      <div className="container mx-auto px-5 py-8">
+        {/* Section Header */}
+        <div className="mb-8">
+          <h1 className="text-2xl font-bold text-gray-900 dark:text-white mb-1">
+            Design your space
+          </h1>
+          <p className="text-gray-500 dark:text-gray-400 text-sm">
+            AI-powered interior design recommendations
+          </p>
+        </div>
+
+        <main className="max-w-4xl">
+          <div className="grid md:grid-cols-2 gap-5">
             {/* Health Check Card */}
-            <div className="bg-white dark:bg-gray-800 rounded-lg shadow-lg p-6">
-              <h2 className="text-xl font-semibold text-gray-900 dark:text-white mb-4">
-                API Health Status
+            <div className="bg-white dark:bg-gray-800 rounded-2xl shadow-sm hover:shadow-md transition-shadow p-6 border border-slate-100 dark:border-gray-700">
+              <h2 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">
+                API health status
               </h2>
               <div className="space-y-3">
                 {healthQuery.isLoading && (
                   <div className="flex items-center space-x-2">
-                    <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-blue-600"></div>
-                    <span className="text-gray-600 dark:text-gray-300">
+                    <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-rose-500"></div>
+                    <span className="text-gray-500 dark:text-gray-400 text-sm">
                       Checking health...
                     </span>
                   </div>
                 )}
                 {healthQuery.isError && (
-                  <div className="text-red-600 dark:text-red-400">
+                  <div className="text-red-600 dark:text-red-400 text-sm">
                     Error:{" "}
                     {healthQuery.error?.message ||
                       "Failed to fetch health status"}
@@ -59,17 +72,17 @@ export default function Home() {
                   <div className="space-y-2">
                     <div className="flex items-center space-x-2">
                       <div
-                        className={`w-3 h-3 rounded-full ${
+                        className={`w-2.5 h-2.5 rounded-full ${
                           healthQuery.data.status === "healthy"
-                            ? "bg-green-500"
+                            ? "bg-emerald-500"
                             : "bg-red-500"
                         }`}
                       ></div>
-                      <span className="text-gray-900 dark:text-white font-medium">
+                      <span className="text-gray-900 dark:text-white font-medium text-sm">
                         Status: {healthQuery.data.status}
                       </span>
                     </div>
-                    <p className="text-gray-600 dark:text-gray-300 text-sm">
+                    <p className="text-gray-500 dark:text-gray-400 text-sm">
                       {healthQuery.data.message}
                     </p>
                   </div>
@@ -78,21 +91,21 @@ export default function Home() {
             </div>
 
             {/* Root Endpoint Card */}
-            <div className="bg-white dark:bg-gray-800 rounded-lg shadow-lg p-6">
-              <h2 className="text-xl font-semibold text-gray-900 dark:text-white mb-4">
-                API Root Endpoint
+            <div className="bg-white dark:bg-gray-800 rounded-2xl shadow-sm hover:shadow-md transition-shadow p-6 border border-slate-100 dark:border-gray-700">
+              <h2 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">
+                API root endpoint
               </h2>
               <div className="space-y-3">
                 {rootQuery.isLoading && (
                   <div className="flex items-center space-x-2">
-                    <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-blue-600"></div>
-                    <span className="text-gray-600 dark:text-gray-300">
+                    <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-rose-500"></div>
+                    <span className="text-gray-500 dark:text-gray-400 text-sm">
                       Loading...
                     </span>
                   </div>
                 )}
                 {rootQuery.isError && (
-                  <div className="text-red-600 dark:text-red-400">
+                  <div className="text-red-600 dark:text-red-400 text-sm">
                     Error:{" "}
                     {rootQuery.error?.message ||
                       "Failed to fetch root endpoint"}
@@ -100,7 +113,7 @@ export default function Home() {
                 )}
                 {rootQuery.isSuccess && (
                   <div className="space-y-2">
-                    <p className="text-gray-900 dark:text-white">
+                    <p className="text-gray-900 dark:text-white text-sm">
                       {rootQuery.data.message}
                     </p>
                   </div>
@@ -110,42 +123,42 @@ export default function Home() {
           </div>
 
           {/* Connection Status */}
-          <div className="mt-8 bg-white dark:bg-gray-800 rounded-lg shadow-lg p-6">
-            <h2 className="text-xl font-semibold text-gray-900 dark:text-white mb-4">
-              Connection Status
+          <div className="mt-6 bg-white dark:bg-gray-800 rounded-2xl shadow-sm p-6 border border-slate-100 dark:border-gray-700">
+            <h2 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">
+              Connection status
             </h2>
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-sm">
               <div className="flex items-center justify-between">
-                <span className="text-gray-600 dark:text-gray-300">
-                  Backend URL:
+                <span className="text-gray-500 dark:text-gray-400">
+                  Backend URL
                 </span>
-                <code className="bg-gray-100 dark:bg-gray-700 px-2 py-1 rounded text-xs">
-                  http://localhost:8000
+                <code className="bg-slate-100 dark:bg-gray-700 px-2 py-1 rounded text-xs font-mono">
+                  localhost:8000
                 </code>
               </div>
               <div className="flex items-center justify-between">
-                <span className="text-gray-600 dark:text-gray-300">
-                  API Prefix:
+                <span className="text-gray-500 dark:text-gray-400">
+                  API prefix
                 </span>
-                <code className="bg-gray-100 dark:bg-gray-700 px-2 py-1 rounded text-xs">
+                <code className="bg-slate-100 dark:bg-gray-700 px-2 py-1 rounded text-xs font-mono">
                   /api
                 </code>
               </div>
               <div className="flex items-center justify-between">
-                <span className="text-gray-600 dark:text-gray-300">
-                  Frontend URL:
+                <span className="text-gray-500 dark:text-gray-400">
+                  Frontend URL
                 </span>
-                <code className="bg-gray-100 dark:bg-gray-700 px-2 py-1 rounded text-xs">
-                  http://localhost:3000
+                <code className="bg-slate-100 dark:bg-gray-700 px-2 py-1 rounded text-xs font-mono">
+                  localhost:3000
                 </code>
               </div>
             </div>
           </div>
 
           {/* Project Management */}
-          <div className="mt-8 bg-white dark:bg-gray-800 rounded-lg shadow-lg p-6">
-            <h2 className="text-xl font-semibold text-gray-900 dark:text-white mb-4">
-              Create New Project
+          <div className="mt-6 bg-white dark:bg-gray-800 rounded-2xl shadow-sm p-6 border border-slate-100 dark:border-gray-700">
+            <h2 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">
+              Create new project
             </h2>
 
             <div className="space-y-4">
@@ -160,16 +173,16 @@ export default function Home() {
                     });
                   }}
                   disabled={createProjectMutation.isPending}
-                  className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                  className="px-5 py-2.5 bg-rose-500 text-white rounded-xl font-medium hover:bg-rose-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors text-sm"
                 >
                   {createProjectMutation.isPending
                     ? "Creating..."
-                    : "Create New Project"}
+                    : "New project"}
                 </button>
 
                 {createProjectMutation.isSuccess && (
-                  <span className="text-green-600 dark:text-green-400 text-sm">
-                    Project created: {createProjectMutation.data?.project_id}
+                  <span className="text-emerald-600 dark:text-emerald-400 text-sm">
+                    Created: {createProjectMutation.data?.project_id}
                   </span>
                 )}
 
@@ -181,18 +194,17 @@ export default function Home() {
               </div>
 
               {/* Project Creation Info */}
-              <div className="border-t pt-4">
-                <p className="text-sm text-gray-600 dark:text-gray-300">
-                  Click "Create New Project" to start a new AI Interior Design
-                  project. You'll be redirected to the project page where you
-                  can interact with the AI agent.
+              <div className="border-t border-slate-100 dark:border-gray-700 pt-4">
+                <p className="text-sm text-gray-500 dark:text-gray-400">
+                  Click "New project" to start a new AI interior design
+                  project. You'll be redirected to the project page.
                 </p>
               </div>
             </div>
           </div>
 
           {/* Projects List */}
-          <div className="mt-8">
+          <div className="mt-6">
             <ProjectsList />
           </div>
         </main>

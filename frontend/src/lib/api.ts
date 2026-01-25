@@ -17,84 +17,134 @@ export const getProjectGeneratedImageUrl = (projectId: string) =>
 // API client functions
 export const apiClient = {
   async get<T>(endpoint: string): Promise<T> {
-    const response = await fetch(`${API_BASE_URL}${endpoint}`);
-    if (!response.ok) {
-      throw new Error(`API request failed: ${response.statusText}`);
+    try {
+      const response = await fetch(`${API_BASE_URL}${endpoint}`, {
+        method: "GET",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        credentials: "include",
+      });
+      
+      if (!response.ok) {
+        throw new Error(`API request failed: ${response.status} ${response.statusText}`);
+      }
+      return response.json();
+    } catch (error) {
+      if (error instanceof TypeError && error.message.includes("fetch")) {
+        throw new Error(`Network error: Cannot connect to backend at ${API_BASE_URL}. Make sure the backend is running on port 8000.`);
+      }
+      throw error;
     }
-    return response.json();
   },
 
   async post<T>(endpoint: string, data?: any): Promise<T> {
-    const response = await fetch(`${API_BASE_URL}${endpoint}`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: data ? JSON.stringify(data) : undefined,
-    });
-    if (!response.ok) {
-      let message = response.statusText;
-      try {
-        const err = await response.json();
-        // FastAPI returns { detail: "..." }
-        if (err && (err.detail || err.message)) {
-          message = err.detail || err.message;
-        }
-      } catch { }
-      throw new Error(`(${response.status}) ${message}`);
+    try {
+      const response = await fetch(`${API_BASE_URL}${endpoint}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        credentials: "include",
+        body: data ? JSON.stringify(data) : undefined,
+      });
+      
+      if (!response.ok) {
+        let message = response.statusText;
+        try {
+          const err = await response.json();
+          // FastAPI returns { detail: "..." }
+          if (err && (err.detail || err.message)) {
+            message = err.detail || err.message;
+          }
+        } catch { }
+        throw new Error(`(${response.status}) ${message}`);
+      }
+      return response.json();
+    } catch (error) {
+      if (error instanceof TypeError && error.message.includes("fetch")) {
+        throw new Error(`Network error: Cannot connect to backend at ${API_BASE_URL}. Make sure the backend is running on port 8000.`);
+      }
+      throw error;
     }
-    return response.json();
   },
 
   async uploadFile<T>(endpoint: string, file: File): Promise<T> {
-    const formData = new FormData();
-    formData.append("image", file);
+    try {
+      const formData = new FormData();
+      formData.append("image", file);
 
-    const response = await fetch(`${API_BASE_URL}${endpoint}`, {
-      method: "POST",
-      body: formData,
-    });
-    if (!response.ok) {
-      throw new Error(`API request failed: ${response.statusText}`);
+      const response = await fetch(`${API_BASE_URL}${endpoint}`, {
+        method: "POST",
+        credentials: "include",
+        body: formData,
+      });
+      
+      if (!response.ok) {
+        throw new Error(`API request failed: ${response.status} ${response.statusText}`);
+      }
+      return response.json();
+    } catch (error) {
+      if (error instanceof TypeError && error.message.includes("fetch")) {
+        throw new Error(`Network error: Cannot connect to backend at ${API_BASE_URL}. Make sure the backend is running on port 8000.`);
+      }
+      throw error;
     }
-    return response.json();
   },
 
   async uploadFiles<T>(endpoint: string, files: File[]): Promise<T> {
-    const formData = new FormData();
-    files.forEach((file) => {
-      formData.append("images", file);
-    });
+    try {
+      const formData = new FormData();
+      files.forEach((file) => {
+        formData.append("images", file);
+      });
 
-    const response = await fetch(`${API_BASE_URL}${endpoint}`, {
-      method: "POST",
-      body: formData,
-    });
-    if (!response.ok) {
-      throw new Error(`API request failed: ${response.statusText}`);
+      const response = await fetch(`${API_BASE_URL}${endpoint}`, {
+        method: "POST",
+        credentials: "include",
+        body: formData,
+      });
+      
+      if (!response.ok) {
+        throw new Error(`API request failed: ${response.status} ${response.statusText}`);
+      }
+      return response.json();
+    } catch (error) {
+      if (error instanceof TypeError && error.message.includes("fetch")) {
+        throw new Error(`Network error: Cannot connect to backend at ${API_BASE_URL}. Make sure the backend is running on port 8000.`);
+      }
+      throw error;
     }
-    return response.json();
   },
 
   async delete(endpoint: string): Promise<void> {
-    console.log(`Deleting endpoint: ${API_BASE_URL}${endpoint}`);
-    const response = await fetch(`${API_BASE_URL}${endpoint}`, {
-      method: "DELETE",
-    });
-    if (!response.ok) {
-      let message = response.statusText;
-      try {
-        const err = await response.json();
-        if (err && (err.detail || err.message)) {
-          message = err.detail || err.message;
-        }
-      } catch { }
-      throw new Error(`(${response.status}) ${message}`);
-    }
-    // Attempt to parse JSON response but don't fail if void is expected
     try {
-      await response.json();
-    } catch { }
+      console.log(`Deleting endpoint: ${API_BASE_URL}${endpoint}`);
+      const response = await fetch(`${API_BASE_URL}${endpoint}`, {
+        method: "DELETE",
+        credentials: "include",
+      });
+      
+      if (!response.ok) {
+        let message = response.statusText;
+        try {
+          const err = await response.json();
+          if (err && (err.detail || err.message)) {
+            message = err.detail || err.message;
+          }
+        } catch { }
+        throw new Error(`(${response.status}) ${message}`);
+      }
+      // Attempt to parse JSON response but don't fail if void is expected
+      try {
+        await response.json();
+      } catch { }
+    } catch (error) {
+      if (error instanceof TypeError && error.message.includes("fetch")) {
+        throw new Error(`Network error: Cannot connect to backend at ${API_BASE_URL}. Make sure the backend is running on port 8000.`);
+      }
+      throw error;
+    }
   },
 };
 
@@ -422,6 +472,9 @@ export const useHealthCheck = () => {
     queryKey: ["health"],
     queryFn: () => apiClient.get<HealthResponse>("/health"),
     staleTime: 5 * 60 * 1000, // 5 minutes
+    retry: 2,
+    retryDelay: 1000,
+    refetchOnWindowFocus: false,
   });
 };
 
@@ -430,6 +483,9 @@ export const useRootEndpoint = () => {
     queryKey: ["root"],
     queryFn: () => apiClient.get<RootResponse>("/"),
     staleTime: 5 * 60 * 1000, // 5 minutes
+    retry: 2,
+    retryDelay: 1000,
+    refetchOnWindowFocus: false,
   });
 };
 
@@ -459,6 +515,9 @@ export const useGetAllProjects = () => {
     queryKey: ["projects"],
     queryFn: () => apiClient.get<ProjectsListResponse>("/projects"),
     staleTime: 5 * 60 * 1000, // 5 minutes
+    retry: 2,
+    retryDelay: 1000,
+    refetchOnWindowFocus: false,
   });
 };
 
@@ -669,6 +728,45 @@ export const useSearchProducts = () => {
   });
 };
 
+interface AutoSelectProductResponse {
+  project_id: string;
+  selected_product: {
+    url: string;
+    title: string;
+    store_name: string;
+    price: string;
+    images: string[];
+    similarity_score?: number;
+    store_trust?: number;
+    [key: string]: unknown;
+  };
+  selection_reason: string;
+  alternatives: Array<{
+    url: string;
+    title: string;
+    store_name: string;
+    price: string;
+    images: string[];
+    [key: string]: unknown;
+  }>;
+  status: string;
+  message: string;
+}
+
+export const useAutoSelectProduct = () => {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (projectId: string) =>
+      apiClient.post<AutoSelectProductResponse>(
+        `/projects/${projectId}/auto-select-product`
+      ),
+    onSuccess: (data) => {
+      queryClient.invalidateQueries({ queryKey: ["project", data.project_id] });
+    },
+  });
+};
+
 export const useSelectProduct = () => {
   const queryClient = useQueryClient();
 
@@ -870,5 +968,228 @@ export const useUpdatePreferredStores = () => {
     onSuccess: (data) => {
       queryClient.invalidateQueries({ queryKey: ["project", data.project_id] });
     },
+  });
+};
+
+// ============================================================================
+// "Like These?" Product Suggestions Feature
+// ============================================================================
+
+export interface PreSearchedProduct {
+  url: string;
+  title: string;
+  image_url: string;
+  store: string;
+  price_str?: string;
+  price?: number;
+  similarity_score?: number;
+}
+
+export interface PreSearchedCategory {
+  recommendation: string;
+  search_query: string;
+  status: "pending" | "complete" | "error";
+  products: PreSearchedProduct[];
+  searched_at?: string;
+  error_message?: string;
+}
+
+export interface SearchRecommendationsResponse {
+  project_id: string;
+  categories: PreSearchedCategory[];
+  total_products: number;
+  status: string;
+  message: string;
+}
+
+export interface ProductSuggestionsResponse {
+  project_id: string;
+  categories: PreSearchedCategory[];
+  total_products: number;
+  overall_status: string;
+  message: string;
+}
+
+export interface FavoriteProduct {
+  category: string;
+  url: string;
+  title: string;
+  image_url: string;
+  store: string;
+  price_str?: string;
+}
+
+export interface FavoriteProductsResponse {
+  project_id: string;
+  favorites_count: number;
+  favorites_by_category: Record<string, number>;
+  status: string;
+  message: string;
+}
+
+// Search products for selected recommendations (triggers the "Like These?" flow)
+export const useSearchRecommendations = () => {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      projectId,
+      recommendations,
+    }: {
+      projectId: string;
+      recommendations: string[];
+    }) =>
+      apiClient.post<SearchRecommendationsResponse>(
+        `/projects/${projectId}/search-recommendations`,
+        { recommendations }
+      ),
+    onSuccess: (data) => {
+      queryClient.invalidateQueries({ queryKey: ["project", data.project_id] });
+      queryClient.invalidateQueries({ queryKey: ["product-suggestions", data.project_id] });
+    },
+  });
+};
+
+// Get pre-searched product suggestions
+export const useGetProductSuggestions = (projectId: string, enabled: boolean = true) => {
+  return useQuery({
+    queryKey: ["product-suggestions", projectId],
+    queryFn: () =>
+      apiClient.get<ProductSuggestionsResponse>(
+        `/projects/${projectId}/product-suggestions`
+      ),
+    enabled: !!projectId && enabled,
+    staleTime: 60 * 1000, // 1 minute
+  });
+};
+
+// Save user's favorite products
+export const useSetFavoriteProducts = () => {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      projectId,
+      favorites,
+    }: {
+      projectId: string;
+      favorites: FavoriteProduct[];
+    }) =>
+      apiClient.post<FavoriteProductsResponse>(
+        `/projects/${projectId}/favorite-products`,
+        { favorites }
+      ),
+    onSuccess: (data) => {
+      queryClient.invalidateQueries({ queryKey: ["project", data.project_id] });
+    },
+  });
+};
+
+// Selected Trending Products for image generation
+export interface SelectedTrendingProduct {
+  category: string;
+  url: string;
+  title: string;
+  image_url: string;
+  store: string;
+  price_str?: string;
+}
+
+export interface SelectedTrendingProductsResponse {
+  project_id: string;
+  products_count: number;
+  products_by_category: Record<string, number>;
+  status: string;
+  message: string;
+}
+
+// Set selected trending products for image generation
+export const useSetSelectedTrendingProducts = () => {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      projectId,
+      products,
+    }: {
+      projectId: string;
+      products: SelectedTrendingProduct[];
+    }) =>
+      apiClient.post<SelectedTrendingProductsResponse>(
+        `/projects/${projectId}/selected-trending-products`,
+        { products }
+      ),
+    onSuccess: (data) => {
+      queryClient.invalidateQueries({ queryKey: ["project", data.project_id] });
+    },
+  });
+};
+
+// ============================================================================
+// Process Furniture Selection (URL Resolution + Affiliate Cart)
+// ============================================================================
+
+export interface SelectedFurnitureProduct {
+  url: string;
+  title: string;
+  image_url?: string;
+  store?: string;
+  price_str?: string;
+  price?: number;
+  furniture_id?: string;
+}
+
+export interface ResolvedProduct {
+  original_url: string;
+  resolved_url: string;
+  title: string;
+  image_url?: string;
+  store?: string;
+  price_str?: string;
+  was_google_shopping: boolean;
+  affiliate_url?: string;
+  product_id?: string;
+}
+
+export interface AffiliateProduct {
+  original_url: string;
+  affiliate_url: string;
+  product_id: string;
+  retailer: string;
+}
+
+export interface RetailerCart {
+  retailer: string;
+  retailer_display_name: string;
+  products: AffiliateProduct[];
+  cart_url: string | null;
+  product_count: number;
+}
+
+export interface ProcessFurnitureSelectionResponse {
+  project_id: string;
+  resolved_products: ResolvedProduct[];
+  retailer_carts: RetailerCart[];
+  total_products: number;
+  resolved_count: number;
+  unresolved_count: number;
+  status: string;
+  message: string;
+}
+
+// Process selected furniture products (resolve URLs + generate affiliate carts)
+export const useProcessFurnitureSelection = () => {
+  return useMutation({
+    mutationFn: ({
+      projectId,
+      selectedProducts,
+    }: {
+      projectId: string;
+      selectedProducts: SelectedFurnitureProduct[];
+    }) =>
+      apiClient.post<ProcessFurnitureSelectionResponse>(
+        `/projects/${projectId}/process-furniture-selection`,
+        { selected_products: selectedProducts }
+      ),
   });
 };

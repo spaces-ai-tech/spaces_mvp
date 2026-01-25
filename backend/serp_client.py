@@ -13,6 +13,8 @@ from serpapi import GoogleSearch
 import requests
 from PIL import Image
 
+from cache_manager import cache_manager
+
 load_dotenv()
 
 
@@ -34,7 +36,7 @@ class SerpClient:
 
     def search_products(self, query: str, num_results: int = 10) -> Dict[str, Any]:
         """
-        Search for furniture products using Google Shopping
+        Search for furniture products using Google Shopping (with caching)
 
         Args:
             query: Search query (e.g., "modern gray sectional sofa")
@@ -43,8 +45,14 @@ class SerpClient:
         Returns:
             Search results from SerpAPI Google Shopping
         """
+        # Check cache first
+        cached = cache_manager.get_product_search("serp", query, num_results)
+        if cached is not None:
+            print(f"[SERP_API] 💾 Cache HIT for query: '{query[:40]}...'")
+            return {"results": cached}
+
         try:
-            print(f"🔍 Searching Google Shopping for: '{query}'")
+            print(f"[SERP_API] Query: '{query}' (requesting {num_results} results)")
 
             # Use Google Shopping search - simple and direct
             search = GoogleSearch(
@@ -52,7 +60,7 @@ class SerpClient:
                     "q": query,
                     "tbm": "shop",
                     "api_key": self.api_key,
-                    "num": min(num_results, 10),
+                    "num": min(num_results, 20),  # Increased from 10 for better coverage
                     "hl": "en",
                     "gl": "us",
                 }
@@ -60,16 +68,16 @@ class SerpClient:
 
             result = search.get_dict()
 
-            print(f"🔍 SERP API Response Keys: {list(result.keys())}")
+            print(f"[SERP_API] Response keys: {list(result.keys())}")
 
             # Check for API errors first
             if "error" in result:
-                print(f"❌ SERP API Error: {result['error']}")
+                print(f"[SERP_API] ERROR: {result['error']}")
                 return {"error": result["error"], "results": []}
 
             # Get shopping results
             shopping_results = result.get("shopping_results", [])
-            print(f"🔍 Found {len(shopping_results)} shopping results")
+            print(f"[SERP_API] Raw shopping_results count: {len(shopping_results)}")
 
             # Debug: Show first shopping result structure if available
             if shopping_results:
@@ -118,38 +126,43 @@ class SerpClient:
                         f"🔧 Created {len(shopping_results)} fallback results from organic"
                     )
 
-            return {
-                "results": [
-                    {
-                        # Map SerpAPI fields to our expected format
-                        "url": self._extract_retailer_url(
-                            item
-                        ),  # Extract direct retailer URL
-                        "title": item.get("title", ""),
-                        "id": item.get("product_id", ""),
-                        "score": 1.0,
-                        "published_date": None,
-                        "author": None,
-                        "extract": item.get("snippet", ""),
-                        "text": item.get("snippet", ""),
-                        "highlights": [],
-                        # SerpAPI Google Shopping specific fields
-                        "price": item.get("price", ""),
-                        "extracted_price": item.get("extracted_price", 0),
-                        "source": item.get("source", ""),
-                        "source_icon": item.get("source_icon", ""),
-                        "thumbnail": item.get("thumbnail", ""),
-                        "thumbnails": item.get("thumbnails", []),
-                        "rating": item.get("rating", 0),
-                        "reviews": item.get("reviews", 0),
-                        "delivery": item.get("delivery", ""),
-                        "installment": item.get(
-                            "installment", {}
-                        ),  # Monthly payment info
-                    }
-                    for item in shopping_results
-                ]
-            }
+            # Build results list
+            results_list = [
+                {
+                    # Map SerpAPI fields to our expected format
+                    "url": self._extract_retailer_url(
+                        item
+                    ),  # Extract direct retailer URL
+                    "title": item.get("title", ""),
+                    "id": item.get("product_id", ""),
+                    "score": 1.0,
+                    "published_date": None,
+                    "author": None,
+                    "extract": item.get("snippet", ""),
+                    "text": item.get("snippet", ""),
+                    "highlights": [],
+                    # SerpAPI Google Shopping specific fields
+                    "price": item.get("price", ""),
+                    "extracted_price": item.get("extracted_price", 0),
+                    "source": item.get("source", ""),
+                    "source_icon": item.get("source_icon", ""),
+                    "thumbnail": item.get("thumbnail", ""),
+                    "thumbnails": item.get("thumbnails", []),
+                    "rating": item.get("rating", 0),
+                    "reviews": item.get("reviews", 0),
+                    "delivery": item.get("delivery", ""),
+                    "installment": item.get(
+                        "installment", {}
+                    ),  # Monthly payment info
+                }
+                for item in shopping_results
+            ]
+
+            # Cache successful results
+            if results_list:
+                cache_manager.set_product_search("serp", query, num_results, results_list)
+
+            return {"results": results_list}
 
         except Exception as e:
             print(f"Error searching products: {e}")
@@ -217,6 +230,106 @@ class SerpClient:
         print(f"✅ Returning {len(products)} real products (no mocks)")
         return products
 
+    # --- Store trust scoring ---
+    def _get_store_trust_score(self, product: Dict[str, Any]) -> float:
+        """Get trust score for a product based on its retailer.
+
+        Args:
+            product: Product dictionary with 'source' or 'store' field
+
+        Returns:
+            Trust score between 0.0 and 1.0
+        """
+        try:
+            from config import FeatureFlags, STORE_TRUST_SCORES
+            if not FeatureFlags.STORE_TRUST_SCORES:
+                return 0.70  # Default neutral score when feature disabled
+        except ImportError:
+            return 0.70
+
+        # Get store name from product
+        store = product.get("source", "") or product.get("store", "")
+        store_lower = store.lower().strip()
+
+        # Direct lookup
+        if store_lower in STORE_TRUST_SCORES:
+            return STORE_TRUST_SCORES[store_lower]
+
+        # Partial match
+        for store_key, score in STORE_TRUST_SCORES.items():
+            if store_key in store_lower or store_lower in store_key:
+                return score
+
+        # Default score for unknown stores
+        return STORE_TRUST_SCORES.get("default", 0.70)
+
+    # --- Multi-signal scoring ---
+    def _compute_multi_signal_score(
+        self,
+        product: Dict[str, Any],
+        visual_similarity: float,
+        query: str = ""
+    ) -> float:
+        """Compute a weighted multi-signal score for a product.
+
+        Args:
+            product: Product dictionary
+            visual_similarity: CLIP visual similarity score (0-1)
+            query: Optional search query for text relevance
+
+        Returns:
+            Combined score between 0.0 and 1.0
+        """
+        try:
+            from config import FeatureFlags
+            if not FeatureFlags.MULTI_SIGNAL_RANKING:
+                # Return visual similarity only when multi-signal disabled
+                return visual_similarity
+        except ImportError:
+            return visual_similarity
+
+        # Weights for different signals
+        weights = {
+            "visual_similarity": 0.50,  # CLIP image match
+            "text_relevance": 0.20,     # Title matches query
+            "store_trust": 0.12,        # Quality retailer
+            "rating": 0.08,             # Customer reviews
+            "price_available": 0.10,    # Has clear pricing
+        }
+
+        scores = {}
+
+        # Visual similarity (already computed)
+        scores["visual_similarity"] = visual_similarity
+
+        # Text relevance - check if query terms appear in title
+        if query:
+            title = product.get("title", "").lower()
+            query_terms = query.lower().split()
+            matching_terms = sum(1 for term in query_terms if term in title)
+            scores["text_relevance"] = min(1.0, matching_terms / max(len(query_terms), 1))
+        else:
+            scores["text_relevance"] = 0.5  # Neutral when no query
+
+        # Store trust
+        scores["store_trust"] = self._get_store_trust_score(product)
+
+        # Rating (normalize to 0-1, assume 5-star scale)
+        rating = product.get("rating", 0) or 0
+        scores["rating"] = min(1.0, rating / 5.0) if rating > 0 else 0.5
+
+        # Price available (binary signal)
+        has_price = bool(product.get("price") or product.get("extracted_price") or product.get("price_str"))
+        scores["price_available"] = 1.0 if has_price else 0.3
+
+        # Compute weighted sum
+        total_score = sum(scores[key] * weights[key] for key in weights)
+
+        # Store component scores for debugging
+        product["_score_components"] = scores
+
+        return total_score
+
     # --- CLIP-based thumbnail scoring ---
     def score_products_with_clip(
         self,
@@ -228,6 +341,7 @@ class SerpClient:
         timeout: float = 1.5,
         max_workers: int = 8,
         max_fetch: int = 10,
+        search_query: str = "",
     ) -> Dict[str, Any]:
         """Download SERP thumbnails in parallel and re-rank using CLIP similarity.
 
@@ -240,10 +354,19 @@ class SerpClient:
             timeout: Per-thumbnail fetch timeout in seconds.
             max_workers: Thread pool size for concurrent fetches.
             max_fetch: Max number of products to fetch/score (rest keep order).
+            search_query: Optional search query for multi-signal text relevance.
 
         Returns:
             Dict with products (reordered/filtered) and scoring metadata.
         """
+        # Check if multi-signal ranking is enabled
+        use_multi_signal = False
+        try:
+            from config import FeatureFlags
+            use_multi_signal = FeatureFlags.MULTI_SIGNAL_RANKING
+        except ImportError:
+            pass
+
         if not clip_client or not getattr(clip_client, "is_available", lambda: False)():
             return {
                 "products": products,
@@ -317,6 +440,16 @@ class SerpClient:
                     else:
                         sim = clip_client.compute_similarity(query_embedding, thumb_embedding)
                         prod["similarity_score"] = sim
+
+                        # Apply multi-signal ranking if enabled
+                        if use_multi_signal:
+                            prod["combined_score"] = self._compute_multi_signal_score(
+                                prod, sim, search_query
+                            )
+                            prod["store_trust"] = self._get_store_trust_score(prod)
+                        else:
+                            prod["combined_score"] = sim
+
                         if sim < drop_threshold:
                             prod["filter_reason"] = "dropped_low_similarity"
                         elif sim > boost_threshold:
@@ -339,8 +472,9 @@ class SerpClient:
         kept = [p for _, p in scored if p.get("similarity_score", 0) >= drop_threshold]
         dropped = [p for _, p in scored if p.get("similarity_score", 0) < drop_threshold]
 
-        # Sort kept by similarity desc, then original order
-        kept.sort(key=lambda p: p.get("similarity_score", 0), reverse=True)
+        # Sort by combined_score (multi-signal) or similarity_score
+        sort_key = "combined_score" if use_multi_signal else "similarity_score"
+        kept.sort(key=lambda p: p.get(sort_key, 0), reverse=True)
         boosted = [p for p in kept if p.get("similarity_score", 0) > boost_threshold]
 
         # Append unscored items after scored ones to preserve some completeness
@@ -348,6 +482,7 @@ class SerpClient:
 
         meta = {
             "scoring": "completed",
+            "multi_signal_ranking": use_multi_signal,
             "thresholds": {"drop": drop_threshold, "boost": boost_threshold},
             "counts": {
                 "input": len(products),
@@ -412,13 +547,13 @@ class SerpClient:
             return []
 
     def reverse_image_search_google_lens_url(self, image_url: str) -> List[Dict[str, Any]]:
-        """Perform Google Lens reverse image search via SerpAPI using a public URL.
+        """Enhanced Google Lens search using all result types for better matching.
 
         Args:
             image_url: Publicly accessible image URL
 
         Returns:
-            List of match dicts (title, link/product_link, source, thumbnail)
+            List of match dicts with priority: exact_matches > visual_matches > knowledge_graph
         """
         try:
             params = {
@@ -430,28 +565,81 @@ class SerpClient:
             result = search.get_dict()
 
             matches: List[Dict[str, Any]] = []
-            for m in result.get("visual_matches", []) or []:
-                matches.append(
-                    {
+            seen_urls = set()
+
+            # Priority 1: exact_matches (identical/near-identical products - highest value)
+            exact_count = 0
+            for m in result.get("exact_matches", []) or []:
+                url = m.get("link", "")
+                if url and url not in seen_urls:
+                    seen_urls.add(url)
+                    matches.append({
                         "title": m.get("title"),
-                        "link": m.get("link"),
-                        "product_link": m.get("product_link") or m.get("link"),
+                        "link": url,
+                        "product_link": m.get("product_link") or url,
                         "source": m.get("source"),
                         "thumbnail": m.get("thumbnail"),
-                    }
-                )
+                        "price": m.get("price"),
+                        "match_type": "exact",
+                    })
+                    exact_count += 1
+            if exact_count > 0:
+                print(f"[LENS] Found {exact_count} exact matches")
 
+            # Priority 2: visual_matches (visually similar products)
+            visual_count = 0
+            for m in result.get("visual_matches", []) or []:
+                url = m.get("link", "")
+                if url and url not in seen_urls:
+                    seen_urls.add(url)
+                    matches.append({
+                        "title": m.get("title"),
+                        "link": url,
+                        "product_link": m.get("product_link") or url,
+                        "source": m.get("source"),
+                        "thumbnail": m.get("thumbnail"),
+                        "price": m.get("price"),
+                        "match_type": "visual",
+                    })
+                    visual_count += 1
+            if visual_count > 0:
+                print(f"[LENS] Found {visual_count} visual matches")
+
+            # Priority 3: knowledge_graph products (product metadata)
+            kg = result.get("knowledge_graph", {})
+            kg_count = 0
+            for item in kg.get("products", []) or []:
+                url = item.get("link", "")
+                if url and url not in seen_urls:
+                    seen_urls.add(url)
+                    matches.append({
+                        "title": item.get("title") or kg.get("title"),
+                        "link": url,
+                        "product_link": url,
+                        "source": item.get("source"),
+                        "thumbnail": item.get("thumbnail"),
+                        "price": item.get("price"),
+                        "match_type": "knowledge_graph",
+                    })
+                    kg_count += 1
+            if kg_count > 0:
+                print(f"[LENS] Found {kg_count} knowledge graph products")
+
+            # Fallback to inline_images if no other matches found
             if not matches:
                 for m in result.get("inline_images", [])[:10]:
-                    matches.append(
-                        {
+                    url = m.get("link", "")
+                    if url and url not in seen_urls:
+                        seen_urls.add(url)
+                        matches.append({
                             "title": m.get("title"),
-                            "link": m.get("link"),
+                            "link": url,
                             "source": m.get("source"),
                             "thumbnail": m.get("thumbnail"),
-                        }
-                    )
+                            "match_type": "inline",
+                        })
 
+            print(f"[LENS] Total matches: {len(matches)}")
             return matches
         except Exception as e:
             print(f"Error in reverse_image_search_google_lens_url: {e}")

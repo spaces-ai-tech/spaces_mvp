@@ -8,6 +8,7 @@ interface ColorPalette {
     name: string;
     colors: string[];
     description: string;
+    isAiOption?: boolean;
 }
 
 interface ColorPaletteScreenProps {
@@ -22,9 +23,10 @@ interface ColorPaletteScreenProps {
 
 const predefinedPalettes: ColorPalette[] = [
     {
-        name: "Let us Decide",
-        colors: ["#A8DADC", "#457B9D", "#D4A574", "#E8E8E8", "#2D3E50"],
-        description: "AI chooses the optimal colors for your space"
+        name: "Let AI Decide",
+        colors: [], // Empty - AI will pick any colors
+        description: "AI analyzes your room and picks the optimal colors",
+        isAiOption: true,
     },
     {
         name: "Deep Blues",
@@ -83,16 +85,12 @@ export function ColorPaletteScreen({
             projectId,
             paletteName: selectedPalette.name,
             colors: selectedPalette.colors,
-            letAiDecide: selectedPalette.name === "Let us Decide",
+            letAiDecide: selectedPalette.isAiOption === true,
         });
     };
 
     const isApplied = currentColorScheme?.palette_name === selectedPalette?.name;
     const isSkipped = Boolean(colorAnalysisSkipped);
-    const paletteAdaptations = colorAnalysis?.palette_adaptations;
-    const showPaletteAdaptations =
-        Boolean(paletteAdaptations) &&
-        paletteAdaptations !== "Fallback analysis used due to response formatting.";
 
     return (
         <div className="mt-8 bg-white dark:bg-gray-800 rounded-lg shadow-lg p-6">
@@ -106,7 +104,7 @@ export function ColorPaletteScreen({
                             Choose Colors
                         </h2>
                         <p className="text-sm text-gray-500 dark:text-gray-400">
-                            Select a color palette to apply to your space
+                            Select a color palette or let AI choose the best colors
                         </p>
                     </div>
                 </div>
@@ -146,7 +144,7 @@ export function ColorPaletteScreen({
                                     {palette.name}
                                 </p>
                             </div>
-                            {palette.name === "Let us Decide" && (
+                            {palette.isAiOption && (
                                 <span className="flex items-center gap-1 text-xs bg-purple-100 dark:bg-purple-900/30 text-purple-600 dark:text-purple-400 px-2 py-1 rounded-full">
                                     <Sparkles className="w-3 h-3" />
                                     AI
@@ -156,15 +154,24 @@ export function ColorPaletteScreen({
                         <p className="text-xs text-gray-500 dark:text-gray-400 mb-3">
                             {palette.description}
                         </p>
-                        <div className="flex gap-1">
-                            {palette.colors.map((color, idx) => (
-                                <div
-                                    key={idx}
-                                    className="flex-1 h-10 rounded-lg border border-gray-200 dark:border-gray-600"
-                                    style={{ backgroundColor: color }}
-                                />
-                            ))}
-                        </div>
+                        {palette.isAiOption ? (
+                            <div className="flex gap-1 items-center justify-center h-10 bg-gradient-to-r from-purple-100 to-indigo-100 dark:from-purple-900/30 dark:to-indigo-900/30 rounded-lg">
+                                <Sparkles className="w-4 h-4 text-purple-500" />
+                                <span className="text-xs text-purple-600 dark:text-purple-400 font-medium">
+                                    AI picks any colors
+                                </span>
+                            </div>
+                        ) : (
+                            <div className="flex gap-1">
+                                {palette.colors.map((color, idx) => (
+                                    <div
+                                        key={idx}
+                                        className="flex-1 h-10 rounded-lg border border-gray-200 dark:border-gray-600"
+                                        style={{ backgroundColor: color }}
+                                    />
+                                ))}
+                            </div>
+                        )}
                     </button>
                 ))}
             </div>
@@ -234,6 +241,38 @@ export function ColorPaletteScreen({
                     </h3>
 
                     <div className="space-y-4">
+                        {/* AI Generated Palette - Show actual colors chosen by AI */}
+                        {currentColorScheme?.palette_name === "Let AI Decide" && colorAnalysis.color_assignments && colorAnalysis.color_assignments.length > 0 && (
+                            <div className="bg-gradient-to-r from-purple-50 to-indigo-50 dark:from-purple-900/20 dark:to-indigo-900/20 rounded-xl p-4 border border-purple-200 dark:border-purple-800">
+                                <div className="flex items-center gap-2 mb-3">
+                                    <Sparkles className="w-5 h-5 text-purple-600 dark:text-purple-400" />
+                                    <p className="font-semibold text-purple-900 dark:text-purple-100">
+                                        AI Generated Palette
+                                    </p>
+                                </div>
+                                <div className="flex gap-2 mb-3">
+                                    {colorAnalysis.color_assignments.slice(0, 5).map((assignment: any, idx: number) => (
+                                        <div
+                                            key={idx}
+                                            className="flex-1 group relative"
+                                        >
+                                            <div
+                                                className="h-14 rounded-lg border-2 border-white dark:border-gray-600 shadow-md transition-transform group-hover:scale-105"
+                                                style={{ backgroundColor: assignment.color_hex }}
+                                                title={`${assignment.color_name} - ${assignment.element}`}
+                                            />
+                                            <p className="text-xs text-center mt-1 font-mono text-gray-600 dark:text-gray-400">
+                                                {assignment.color_hex}
+                                            </p>
+                                        </div>
+                                    ))}
+                                </div>
+                                <p className="text-xs text-purple-700 dark:text-purple-300">
+                                    Colors dynamically chosen by AI based on your room analysis
+                                </p>
+                            </div>
+                        )}
+
                         {/* Space Summary */}
                         <div className="bg-gray-50 dark:bg-gray-900/50 rounded-lg p-4">
                             <p className="text-sm text-gray-700 dark:text-gray-300">
@@ -264,33 +303,26 @@ export function ColorPaletteScreen({
                                             className="flex items-center gap-3 p-3 bg-gray-50 dark:bg-gray-900/50 rounded-lg"
                                         >
                                             <div
-                                                className="w-8 h-8 rounded-md border border-gray-200 dark:border-gray-600"
+                                                className="w-10 h-10 rounded-md border border-gray-200 dark:border-gray-600 shadow-sm"
                                                 style={{ backgroundColor: assignment.color_hex }}
                                             />
-                                            <div>
+                                            <div className="flex-1">
                                                 <p className="text-sm font-medium text-gray-900 dark:text-white">
                                                     {assignment.element}
                                                 </p>
-                                                <p className="text-xs text-gray-500 dark:text-gray-400">
-                                                    {assignment.color_name}
-                                                    {assignment.finish && ` • ${assignment.finish}`}
-                                                </p>
+                                                <div className="flex items-center gap-2">
+                                                    <p className="text-xs font-mono text-purple-600 dark:text-purple-400">
+                                                        {assignment.color_hex}
+                                                    </p>
+                                                    <span className="text-xs text-gray-500 dark:text-gray-400">
+                                                        {assignment.color_name}
+                                                        {assignment.finish && ` - ${assignment.finish}`}
+                                                    </span>
+                                                </div>
                                             </div>
                                         </div>
                                     ))}
                                 </div>
-                            </div>
-                        )}
-
-                        {/* Palette Adaptations */}
-                        {showPaletteAdaptations && (
-                            <div className="bg-amber-50 dark:bg-amber-900/20 rounded-lg p-4">
-                                <p className="text-sm font-medium text-amber-800 dark:text-amber-200 mb-1">
-                                    Design Adaptations
-                                </p>
-                                <p className="text-sm text-amber-700 dark:text-amber-300">
-                                    {paletteAdaptations}
-                                </p>
                             </div>
                         )}
                     </div>

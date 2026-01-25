@@ -336,6 +336,7 @@ export default function ProjectPage() {
                   selectedRecommendations.length > 0 ||
                   (project.context.inspiration_recommendations || []).length > 0
                 }
+                selectedTrendingProducts={project.context.selected_trending_products || []}
               />
             )}
 

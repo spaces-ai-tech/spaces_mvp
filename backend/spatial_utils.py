@@ -30,12 +30,13 @@ class SpatialDetector:
         logger.info(f"SpatialDetector initialized with model: {self.model}")
     
     def get_object_bbox(
-        self, 
-        image_bytes: bytes, 
-        click_x: float, 
+        self,
+        image_bytes: bytes,
+        click_x: float,
         click_y: float,
         image_width: int = None,
-        image_height: int = None
+        image_height: int = None,
+        space_type: str = None
     ) -> Dict[str, Any]:
         """
         Detect furniture objects at the click location.
@@ -66,7 +67,17 @@ IMPORTANT - SEPARATE OVERLAPPING ITEMS:
 - A lamp ON a nightstand = 2 items: "table lamp" AND "nightstand"
 - Bedding ON a bed = multiple items: "duvet/comforter", "pillows", "bed frame"
 
+CRITICAL DISTINCTIONS FOR BEDS:
+- "bed frame" = the STRUCTURAL furniture piece (headboard, footboard, rails, legs) - this is FURNITURE
+- "bedding/duvet/comforter" = the FABRIC covering ON TOP of the bed - this is TEXTILE
+- "pillows" = cushions on the bed - these are ACCESSORIES
+- When clicking on the HEADBOARD area of a bed, the PRIMARY item is the BED FRAME, not the bedding
+- An "upholstered bed" is a BED FRAME with fabric upholstery - it is NOT bedding
+- Note distinctive features: tufting style (channel, button, diamond), headboard shape (wingback, panel, arched), leg material/color (gold, brass, wood, chrome)
+
 BE SPECIFIC with labels:
+- "channel tufted upholstered bed" not "duvet cover"
+- "wingback upholstered bed frame" not "comforter"
 - "brass table lamp" not "lamp"
 - "tufted armchair" not "chair"
 
@@ -76,9 +87,9 @@ Return JSON with this EXACT structure:
         "label": "most prominent/clicked item",
         "bbox": [ymin, xmin, ymax, xmax],
         "color": "primary color",
-        "material": "main material",
-        "style": "design style",
-        "search_query": "4-6 word shopping query"
+        "material": "main material (wood, upholstered fabric, metal, etc)",
+        "style": "design style (modern, art deco, traditional, etc)",
+        "search_query": "4-6 word shopping query for finding this exact item"
     }},
     "additional_items": [
         {{
@@ -126,12 +137,12 @@ Return ONLY valid JSON, no markdown."""
             
             if not result:
                 print(f"⚠️ SpatialDetector: Failed to parse response, using fallback. Raw: {raw_text[:200]}")
-                return self._fallback_detection(click_x, click_y)
-            
+                return self._fallback_detection(click_x, click_y, space_type)
+
             primary = result.get("primary", {})
             if not primary or not primary.get("label"):
                 print(f"⚠️ SpatialDetector: No primary detection in result: {result}. Using fallback")
-                return self._fallback_detection(click_x, click_y)
+                return self._fallback_detection(click_x, click_y, space_type)
             
             # Parse bbox
             bbox = primary.get("bbox", [0, 0, 1000, 1000])
@@ -182,8 +193,8 @@ Return ONLY valid JSON, no markdown."""
         except Exception as e:
             logger.error(f"Spatial detection failed: {e}", exc_info=True)
             print(f"❌ SpatialDetector error: {e}")
-            return self._fallback_detection(click_x, click_y)
-    
+            return self._fallback_detection(click_x, click_y, space_type)
+
     def _parse_gemini_response(self, response_text: str) -> Optional[Dict]:
         """Parse Gemini response, handling various formats."""
         # Strip markdown code blocks if present
@@ -207,8 +218,12 @@ Return ONLY valid JSON, no markdown."""
         
         return None
     
-    def _fallback_detection(self, click_x: float, click_y: float) -> Dict[str, Any]:
-        """Return a fallback detection when Gemini fails."""
+    def _fallback_detection(self, click_x: float, click_y: float, space_type: str = None) -> Dict[str, Any]:
+        """Return a fallback detection when Gemini fails.
+
+        Returns generic "furniture" - the caller should use CLIP to classify
+        the cropped region for accurate furniture type detection.
+        """
         box_size = 0.20  # 20% box around click point
         bbox_normalized = [
             max(0, click_y - box_size / 2),  # ymin
@@ -216,9 +231,12 @@ Return ONLY valid JSON, no markdown."""
             min(1, click_y + box_size / 2),  # ymax
             min(1, click_x + box_size / 2),  # xmax
         ]
-        
+
+        print(f"⚠️ Using fallback detection (space_type={space_type}, click=({click_x:.2f}, {click_y:.2f}))")
+        print(f"   ℹ️ CLIP will be used to classify the cropped region")
+
         return {
-            "label": "furniture",
+            "label": "furniture",  # Generic - CLIP will refine this
             "bbox": [int(b * 1000) for b in bbox_normalized],
             "bbox_normalized": bbox_normalized,
             "attributes": {"color": "unknown", "material": "unknown", "style": "unknown"},

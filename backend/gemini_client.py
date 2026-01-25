@@ -154,6 +154,70 @@ class GeminiClient:
             print(f"❌ Error in analyze_image_with_vision: {e}")
             raise e
 
+    def analyze_images_with_vision(
+        self,
+        prompt: str,
+        pydantic_model: Type[T],
+        image_parts: List[Dict[str, Any]],  # List of {"inline_data": {"mime_type": "...", "data": "base64..."}}
+        model: str = "gemini-3-flash-preview",
+        max_tokens: Optional[int] = None,
+        system_message: Optional[str] = None,
+    ) -> T:
+        """
+        Analyze multiple images using Vision API with structured output.
+        Used for batch product evaluation.
+
+        Args:
+            prompt: The prompt describing what to analyze
+            pydantic_model: Pydantic model class for structured output
+            image_parts: List of image dicts with inline_data containing mime_type and base64 data
+            model: The vision model to use
+            max_tokens: Maximum tokens
+            system_message: Optional system message
+        """
+        try:
+            # Convert image_parts to PIL images
+            from PIL import Image
+            from io import BytesIO
+            import base64
+            
+            contents = [prompt]
+            for img_part in image_parts:
+                inline_data = img_part.get("inline_data", {})
+                img_b64 = inline_data.get("data", "")
+                if img_b64:
+                    img_bytes = base64.b64decode(img_b64)
+                    pil_image = Image.open(BytesIO(img_bytes))
+                    contents.append(pil_image)
+            
+            config = types.GenerateContentConfig(
+                response_modalities=["TEXT"],
+                response_mime_type="application/json",
+                response_schema=pydantic_model,
+                temperature=0.3,  # Moderate for evaluation tasks
+            )
+
+            if max_tokens:
+                config.max_output_tokens = max_tokens
+                
+            if system_message:
+                config.system_instruction = system_message
+
+            response = self.client.models.generate_content(
+                model=model,
+                contents=contents,
+                config=config,
+            )
+
+            if response.text:
+                return pydantic_model.model_validate_json(response.text)
+            else:
+                raise ValueError("Empty response from Gemini Vision (multi-image)")
+
+        except Exception as e:
+            print(f"❌ Error in analyze_images_with_vision: {e}")
+            raise e
+
     def analyze_color_application(
         self,
         image_path: str,
@@ -444,45 +508,72 @@ Follow the required JSON schema exactly."""
                 }
 
             def build_fallback_color_analysis() -> Dict[str, Any]:
-                swatches = [{"hex": c, "description": "Palette color"} for c in palette_colors]
-                primary = swatches[:2] or [{"hex": "#DDDDDD", "description": "Primary neutral"}]
-                secondary = swatches[2:4]
-                accent = swatches[4:5]
+                # When let_ai_decide is True and palette is empty, use sensible defaults
+                if let_ai_decide and not palette_colors:
+                    # Provide default AI-like color choices based on space type
+                    primary = [
+                        {"hex": "#F5F0E6", "description": "Warm neutral base"},
+                        {"hex": "#E8DCC8", "description": "Soft cream accent"}
+                    ]
+                    secondary = [
+                        {"hex": "#A08060", "description": "Earthy mid-tone"},
+                        {"hex": "#C8B896", "description": "Natural sand"}
+                    ]
+                    accent = [{"hex": "#6B4423", "description": "Rich brown accent"}]
+                    space_summary = f"AI-selected color scheme for your {space_type}. Warm neutrals create a welcoming, versatile foundation."
+                    color_theory = "Analogous"
+                    color_rationale = "Warm neutrals and earth tones work harmoniously together for a cohesive, inviting space."
+                else:
+                    swatches = [{"hex": c, "description": "Palette color"} for c in palette_colors]
+                    primary = swatches[:2] or [{"hex": "#E8E4DE", "description": "Light neutral"}]
+                    secondary = swatches[2:4] or [{"hex": "#B8AFA6", "description": "Mid-tone neutral"}]
+                    accent = swatches[4:5] or [{"hex": "#6B5B4F", "description": "Dark accent"}]
+                    space_summary = f"Color guidance for a {space_type} based on the selected palette."
+                    color_theory = "Analogous"
+                    color_rationale = "Palette tones are adjacent and cohesive."
+
                 assignments = [
                     {
                         "element": "Walls",
                         "color_hex": primary[0]["hex"],
-                        "color_name": "Primary wall color",
+                        "color_name": primary[0]["description"],
                         "finish": "matte",
                         "notes": "Use for dominant wall surfaces.",
                     },
                     {
                         "element": "Textiles",
                         "color_hex": (secondary[0]["hex"] if secondary else primary[0]["hex"]),
-                        "color_name": "Secondary textile color",
+                        "color_name": (secondary[0]["description"] if secondary else "Secondary color"),
                         "finish": None,
                         "notes": "Apply to curtains, bedding, or rugs.",
                     },
                     {
+                        "element": "Furniture",
+                        "color_hex": (primary[1]["hex"] if len(primary) > 1 else primary[0]["hex"]),
+                        "color_name": (primary[1]["description"] if len(primary) > 1 else "Furniture color"),
+                        "finish": "satin",
+                        "notes": "For larger furniture pieces.",
+                    },
+                    {
                         "element": "Accents",
                         "color_hex": (accent[0]["hex"] if accent else primary[0]["hex"]),
-                        "color_name": "Accent color",
+                        "color_name": (accent[0]["description"] if accent else "Accent color"),
                         "finish": None,
                         "notes": "Use for decor and small accessories.",
                     },
                 ]
                 return {
-                    "space_summary": f"Color guidance for a {space_type} based on the selected palette.",
+                    "space_summary": space_summary,
                     "primary_colors": primary,
                     "secondary_colors": secondary,
                     "accent_colors": accent,
-                    "color_theory_approach": "Analogous",
-                    "color_theory_rationale": "Palette tones are adjacent and cohesive.",
+                    "color_theory_approach": color_theory,
+                    "color_theory_rationale": color_rationale,
                     "color_assignments": assignments,
                     "lighting_notes": "Consider lighting temperature when evaluating final tones.",
                     "cohesion_tips": "Repeat key hues across adjacent spaces for continuity.",
                     "personalization_suggestions": "Rotate accent textiles seasonally for variety.",
-                    "palette_adaptations": None,
+                    "palette_adaptations": "AI-generated palette for optimal room aesthetics." if let_ai_decide else None,
                 }
 
             try:
@@ -503,8 +594,11 @@ Follow the required JSON schema exactly."""
                 return result.model_dump()
             except Exception as parse_err:
                 print(f"❌ Failed to parse Color Agent response: {parse_err}")
-                print(f"Raw response: {response.text}")
+                print(f"Raw response (first 1000 chars): {response.text[:1000]}...")
+                print(f"📋 Using fallback color analysis. let_ai_decide={let_ai_decide}, palette_colors={palette_colors}")
                 fallback = build_fallback_color_analysis()
+                print(f"📋 Fallback primary_colors: {fallback.get('primary_colors', [])}")
+                print(f"📋 Fallback color_assignments: {[a.get('color_hex') for a in fallback.get('color_assignments', [])]}")
                 result = ColorAnalysis.model_validate(fallback)
                 return result.model_dump()
 
@@ -662,34 +756,66 @@ REMEMBER: Keep walls, doors, flooring, ceiling unchanged. Focus on furniture, de
         self,
         original_room_image_path: str,
         prompt: str,
+        product_images: Optional[List[Dict[str, str]]] = None,
     ) -> str:
         """
         Generate a redesigned room image based on inspiration
         using Gemini 3 Pro Image (Nano Banana Pro)
+
+        Args:
+            original_room_image_path: Path to the original room image
+            prompt: The generation prompt
+            product_images: Optional list of dicts with 'image_url' and 'title' for trending products
         """
         try:
             print(f"🎨 Generating room redesign...")
-            
-            # Load images
+
+            # Load room image
             original_room_image = Image.open(original_room_image_path)
-            
+
+            # Download product images if provided
+            downloaded_product_images = []
+            product_titles = []
+            if product_images:
+                for product in product_images:
+                    img = self._download_image(product.get("image_url", ""))
+                    if img:
+                        downloaded_product_images.append(img)
+                        product_titles.append(product.get("title", "product"))
+
+                if downloaded_product_images:
+                    print(f"📦 Downloaded {len(downloaded_product_images)} product reference images")
+
             # Use 'gemini-3-pro-image-preview'
-            model_name = "gemini-3-pro-image-preview" 
-            
+            model_name = "gemini-3-pro-image-preview"
+
             config = types.GenerateContentConfig(
                 response_modalities=["IMAGE"],
             )
 
+            # Add product reference instruction if we have product images
+            product_reference_text = ""
+            if downloaded_product_images:
+                product_reference_text = f"""
+
+### PRODUCT REFERENCE IMAGES (CRITICAL)
+The following {len(downloaded_product_images)} product reference images are provided. You MUST incorporate these EXACT products into the room:
+{chr(10).join([f"- {title}" for title in product_titles])}
+
+MATCH THE PRODUCTS EXACTLY:
+- The furniture in the generated image MUST match the exact color shown in the product reference images
+- Match the exact texture, pattern, and material appearance from the reference
+- Match the exact shape, proportions, and design details
+- DO NOT improvise or change any aspect of the product appearance
+- Use the product images as authoritative reference for how these items should look"""
+
             # Add technical requirement for aspect ratio
-            final_prompt = f"{prompt}\n\nTechnical Requirement: Generate the image with a 1:1 Square Aspect Ratio."
+            final_prompt = f"{prompt}{product_reference_text}\n\nTechnical Requirement: Generate the image with a 1:1 Square Aspect Ratio."
 
-            # Prepare the contents: text prompt + input image
-            contents = [
-                final_prompt,
-                original_room_image
-            ]
+            # Prepare the contents: text prompt + room image + product images
+            contents = [final_prompt, original_room_image] + downloaded_product_images
 
-            print(f"🚀 Sending request to {model_name}...")
+            print(f"🚀 Sending request to {model_name} with {len(downloaded_product_images)} product images...")
             response = self.client.models.generate_content(
                 model=model_name,
                 contents=contents,
@@ -697,14 +823,14 @@ REMEMBER: Keep walls, doors, flooring, ceiling unchanged. Focus on furniture, de
             )
 
             generated_image_b64 = None
-            
+
             # Extract image from response
             for part in response.parts:
                 if part.inline_data:
                     generated_image_b64 = base64.b64encode(part.inline_data.data).decode('utf-8')
                     print("✅ Successfully generated redesign image")
                     break
-            
+
             if not generated_image_b64:
                  raise ValueError("No image generated in response")
 
@@ -873,25 +999,64 @@ REMEMBER: Keep walls, doors, flooring, ceiling unchanged. Focus on furniture, de
 You are a master of Architectural Photography and Interior Restoration. Your task is to modify this {space_type} photograph by integrating the following products: {titles_str}.
 The goal is a "Real-Life" photograph, NOT a digital render.
 
-### 1. STRUCTURAL LOCKDOWN (NON-NEGOTIABLE)
-DO NOT ALTER: Walls, ceiling, window frames, door locations, flooring material, or electrical outlets.
-PERSPECTIVE: Maintain the exact lens focal length and camera angle of the original photo.
+### 1. STRUCTURAL LOCKDOWN (ABSOLUTELY NON-NEGOTIABLE)
+You are EDITING an existing photograph, NOT creating a new room.
 
-### 2. PHOTOGRAPHIC REALISM PROTOCOLS (CRITICAL)
-LIGHTING PHYSICS: All illumination must come from existing windows and visible lamps. Match the shadow direction and hardness of the original.
-MATERIAL AUTHENTICITY: Wood must show natural grain and micro-scratches. Fabrics must show visible weave and realistic folding. Metal must reflect the room accurately, not generic white highlights.
-OPTICAL IMPERFECTIONS: Include subtle depth of field, realistic color grading, and ambient occlusion in corners.
-CAMERA SIMULATION: Emulate a full-frame DSLR with 24-35mm lens. Include minor vignetting.
+PRESERVE EXACTLY (DO NOT CHANGE):
+- Wall positions, angles, colors, and textures
+- Window locations, sizes, shapes, and frames
+- Door positions, sizes, and frames
+- Flooring type, pattern, color, and boundaries
+- Ceiling height, color, and features (lights, fans, beams)
+- Existing architectural elements (moldings, columns, built-ins, alcoves)
+- Light switch and electrical outlet positions
+- Room dimensions and overall shape
 
-### 3. DESIGN CONTEXT
+CAMERA MUST MATCH THE ORIGINAL:
+- Exact same viewing angle as the original photo
+- Same focal length (do not zoom in or out)
+- Same horizon line position
+- Same perspective distortion
+- Same field of view boundaries
+
+SPATIAL PROPORTION CHECK:
+- Room dimensions must be IDENTICAL - if the original shows a 12x14ft room, the output must show the SAME sized space
+- Furniture scale must match the room proportions from the original
+- A person of average height should fit the same way in both images
+- Doorways and windows must appear the same relative size
+- The floor area must remain constant
+
+FAILURE CRITERIA: If ANY wall moves, window changes position, floor pattern changes, room dimensions change, or the room shape differs from the original - the generation has FAILED.
+
+### 2. PRODUCT REFERENCE IMAGES (CRITICAL)
+You are provided with reference images of the actual products to integrate.
+
+MATCH THE PRODUCTS EXACTLY:
+- The furniture in the generated image MUST match the exact color shown in the product reference images
+- Match the exact texture, pattern, and material appearance from the reference
+- Match the exact shape, proportions, and design details
+- Match fabric patterns, wood grain direction, metal finishes exactly as shown
+- DO NOT improvise or change any aspect of the product appearance
+
+USE PRODUCT IMAGES AS AUTHORITATIVE: If there is any doubt about how the product looks, ALWAYS defer to what is shown in the reference image.
+
+### 3. PHOTOGRAPHIC REALISM PROTOCOLS (CRITICAL)
+LIGHTING PHYSICS: All illumination must come from existing windows and visible lamps in the original. Match the shadow direction and hardness of the original photo exactly.
+MATERIAL AUTHENTICITY: Wood must show natural grain and micro-scratches. Fabrics must show visible weave and realistic folding. Metal must reflect the room environment, not generic white highlights.
+OPTICAL IMPERFECTIONS: Include subtle depth of field, realistic color grading matching the original, and ambient occlusion in corners.
+CAMERA SIMULATION: Emulate a full-frame DSLR with 24-35mm lens. Include minor vignetting matching the original.
+
+### 4. DESIGN CONTEXT
 {style_context}
 {color_context}
 {placement_context}
 {user_request}
 
-### 4. OUTPUT REQUIREMENT
-Generate a high-resolution photograph. If it looks like a "3D render" or has a smooth, plastic, digital appearance, it has FAILED.
-It MUST look like a before-and-after photo taken by the same camera in the same physical room."""
+### 5. OUTPUT REQUIREMENT
+Generate a high-resolution photograph that looks IDENTICAL to the original room with only the specified products added/changed.
+If it looks like a "3D render" or has a smooth, plastic, digital appearance, it has FAILED.
+If the room structure differs from the original in ANY way, it has FAILED.
+It MUST look like a before-and-after photo taken by the same camera in the same physical room with only furniture changes."""
 
         return prompt
 

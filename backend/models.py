@@ -429,6 +429,47 @@ class ImprovementMarker(BaseModel):
     )
 
 
+class PreSearchedProduct(BaseModel):
+    """Individual product from pre-search for recommendations."""
+    url: str
+    title: str
+    image_url: str
+    store: str
+    price_str: Optional[str] = None
+    price: Optional[float] = None
+    similarity_score: Optional[float] = None
+
+
+class PreSearchedCategory(BaseModel):
+    """Products found for a single recommendation category."""
+    recommendation: str = Field(..., description="The recommendation this search is for, e.g. 'Add Velvet Bed'")
+    search_query: str = Field(..., description="Generated search query used")
+    status: str = Field(default="pending", description="pending | complete | error")
+    products: List[PreSearchedProduct] = Field(default_factory=list)
+    searched_at: Optional[str] = None
+    error_message: Optional[str] = None
+
+
+class FavoriteProduct(BaseModel):
+    """User's selected product from the 'Like These?' suggestions."""
+    category: str = Field(..., description="Which recommendation this product is for")
+    url: str
+    title: str
+    image_url: str
+    store: str
+    price_str: Optional[str] = None
+
+
+class SelectedTrendingProduct(BaseModel):
+    """User's selected product from trending products for image generation."""
+    category: str = Field(..., description="Which recommendation category this product is for")
+    url: str
+    title: str
+    image_url: str
+    store: str
+    price_str: Optional[str] = None
+
+
 class ProjectContext(BaseModel):
     """
     Project context that evolves through the design workflow.
@@ -512,6 +553,24 @@ class ProjectContext(BaseModel):
     # User preferences
     preferred_stores: List[str] = Field(
         default_factory=list, description="List of user's preferred retail stores"
+    )
+
+    # Pre-searched product suggestions (for "Like These?" feature)
+    pre_searched_categories: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Pre-searched products by recommendation category. Key is recommendation string."
+    )
+
+    # User's favorite products from "Like These?" screen
+    favorite_products: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Products favorited by user from the 'Like These?' suggestion screen"
+    )
+
+    # User's selected trending products for image generation
+    selected_trending_products: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Trending products selected by user for inclusion in image generation"
     )
 
     def is_ready_for_markers(self) -> bool:
@@ -792,6 +851,27 @@ class ProductSelectionResponse(BaseModel):
     message: str
 
 
+class AutoSelectProductResponse(BaseModel):
+    """
+    Response model for AI auto-selection of best product.
+
+    Attributes:
+        project_id (str): ID of the project
+        selected_product (Dict[str, Any]): The auto-selected product details
+        selection_reason (str): Why this product was selected
+        alternatives (List[Dict[str, Any]]): Other products as alternatives
+        status (str): Status of the operation
+        message (str): Human-readable message
+    """
+
+    project_id: str
+    selected_product: Dict[str, Any]
+    selection_reason: str
+    alternatives: List[Dict[str, Any]]
+    status: str
+    message: str
+
+
 class ImageGenerationResponse(BaseModel):
     """
     Response model for Gemini image generation.
@@ -894,6 +974,8 @@ class BatchFurnitureAnalysisRequest(BaseModel):
 class FurnitureAnalysisItem(BaseModel):
     """
     Analysis result for a single furniture item.
+    When is_bed=True, bed_components contains separate product searches
+    for bed_frame, bedding, throw, and pillows.
     """
     id: str
     furniture_type: str
@@ -903,6 +985,8 @@ class FurnitureAnalysisItem(BaseModel):
     color: str
     search_query: str
     products: List[Dict[str, Any]]
+    is_bed: bool = False
+    bed_components: Optional[Dict[str, List[Dict[str, Any]]]] = None
 
 
 class BatchFurnitureAnalysisResponse(BaseModel):
@@ -1020,3 +1104,197 @@ class AffiliateCartResponse(BaseModel):
     total_retailers: int = Field(..., description="Number of different retailers")
     status: str = Field(default="success", description="Status of the operation")
     message: str = Field(default="Affiliate carts generated successfully")
+
+
+# ============================================================================
+# "Like These?" Product Suggestions Feature
+# ============================================================================
+
+class SearchRecommendationsRequest(BaseModel):
+    """
+    Request model for searching products for selected recommendations.
+    """
+    recommendations: List[str] = Field(
+        ...,
+        description="List of selected recommendations to search products for",
+        min_length=1
+    )
+
+
+class SearchRecommendationsResponse(BaseModel):
+    """
+    Response model for product search by recommendations.
+    """
+    project_id: str
+    categories: List[PreSearchedCategory] = Field(
+        ...,
+        description="Products found for each recommendation category"
+    )
+    total_products: int = Field(..., description="Total products found across all categories")
+    status: str = Field(default="success")
+    message: str = Field(default="Products searched successfully")
+
+
+class ProductSuggestionsResponse(BaseModel):
+    """
+    Response model for getting pre-searched product suggestions.
+    """
+    project_id: str
+    categories: List[PreSearchedCategory] = Field(
+        default_factory=list,
+        description="Pre-searched products organized by recommendation"
+    )
+    total_products: int = Field(default=0)
+    overall_status: str = Field(
+        default="pending",
+        description="all_complete | some_pending | all_error | empty"
+    )
+    message: str
+
+
+class FavoriteProductsRequest(BaseModel):
+    """
+    Request model for saving user's favorite products.
+    """
+    favorites: List[FavoriteProduct] = Field(
+        ...,
+        description="List of products favorited by the user"
+    )
+
+
+class FavoriteProductsResponse(BaseModel):
+    """
+    Response model after saving favorite products.
+    """
+    project_id: str
+    favorites_count: int = Field(..., description="Total number of favorites saved")
+    favorites_by_category: Dict[str, int] = Field(
+        default_factory=dict,
+        description="Count of favorites per category"
+    )
+    status: str = Field(default="success")
+    message: str = Field(default="Favorite products saved successfully")
+
+
+class SelectedTrendingProductsRequest(BaseModel):
+    """
+    Request model for saving user's selected trending products for image generation.
+    """
+    products: List[SelectedTrendingProduct] = Field(
+        ...,
+        description="List of trending products selected by the user for image generation"
+    )
+
+
+class SelectedTrendingProductsResponse(BaseModel):
+    """
+    Response model after saving selected trending products.
+    """
+    project_id: str
+    products_count: int = Field(..., description="Total number of products saved")
+    products_by_category: Dict[str, int] = Field(
+        default_factory=dict,
+        description="Count of products per category"
+    )
+    status: str = Field(default="success")
+    message: str = Field(default="Selected trending products saved successfully")
+
+
+# ============================================================================
+# Flutter API Response Models
+# ============================================================================
+
+class ColorAnalysisResponse(BaseModel):
+    """Response model for GET /projects/{id}/color-analysis endpoint."""
+    project_id: str
+    color_analysis: Optional[ColorAnalysis] = Field(
+        default=None,
+        description="Color analysis results with palettes and assignments"
+    )
+    skipped: bool = Field(default=False, description="Whether color analysis was skipped")
+    status: str = Field(default="success")
+    message: str = Field(default="Color analysis retrieved successfully")
+
+
+class StyleAnalysisResponse(BaseModel):
+    """Response model for GET /projects/{id}/style-analysis endpoint."""
+    project_id: str
+    style_analysis: Optional[StyleAnalysis] = Field(
+        default=None,
+        description="Style analysis results with materials and furniture recommendations"
+    )
+    skipped: bool = Field(default=False, description="Whether style analysis was skipped")
+    status: str = Field(default="success")
+    message: str = Field(default="Style analysis retrieved successfully")
+
+
+class TrendingProductsResponse(BaseModel):
+    """Response model for GET /projects/{id}/trending-products endpoint."""
+    project_id: str
+    categories: List[PreSearchedCategory] = Field(
+        default_factory=list,
+        description="Pre-searched product categories"
+    )
+    selected_products: List[SelectedTrendingProduct] = Field(
+        default_factory=list,
+        description="Products selected by the user for image generation"
+    )
+    favorite_products: List[FavoriteProduct] = Field(
+        default_factory=list,
+        description="User's favorite products"
+    )
+    status: str = Field(default="success")
+    message: str = Field(default="Trending products retrieved successfully")
+
+
+# ============================================================================
+# Process Furniture Selection Models (Google Shopping URL Resolution + Affiliate Cart)
+# ============================================================================
+
+class SelectedFurnitureProduct(BaseModel):
+    """A product selected by the user from furniture analysis."""
+    url: str = Field(..., description="Product URL (may be Google Shopping redirect)")
+    title: str = Field(..., description="Product title")
+    image_url: Optional[str] = Field(default=None, description="Product image URL")
+    store: Optional[str] = Field(default=None, description="Store/retailer name")
+    price_str: Optional[str] = Field(default=None, description="Price as string")
+    price: Optional[float] = Field(default=None, description="Price as number")
+    furniture_id: Optional[str] = Field(default=None, description="ID of the furniture item this product belongs to")
+
+
+class ResolvedProduct(BaseModel):
+    """Product with resolved retailer URL."""
+    original_url: str = Field(..., description="Original URL (possibly Google Shopping)")
+    resolved_url: str = Field(..., description="Resolved direct retailer URL")
+    title: str = Field(..., description="Product title")
+    image_url: Optional[str] = Field(default=None, description="Product image URL")
+    store: Optional[str] = Field(default=None, description="Store/retailer name")
+    price_str: Optional[str] = Field(default=None, description="Price as string")
+    was_google_shopping: bool = Field(default=False, description="Whether original URL was a Google Shopping redirect")
+    affiliate_url: Optional[str] = Field(default=None, description="Affiliate-tagged URL")
+    product_id: Optional[str] = Field(default=None, description="Extracted product ID (ASIN, SKU, etc.)")
+
+
+class ProcessFurnitureSelectionRequest(BaseModel):
+    """Request to process selected furniture products."""
+    selected_products: List[SelectedFurnitureProduct] = Field(
+        ..., description="Products selected from furniture analysis"
+    )
+
+
+class ProcessFurnitureSelectionResponse(BaseModel):
+    """Response from processing furniture selection."""
+    project_id: str
+    resolved_products: List[ResolvedProduct] = Field(
+        default_factory=list,
+        description="Products with resolved retailer URLs"
+    )
+    retailer_carts: List[RetailerCart] = Field(
+        default_factory=list,
+        description="Products grouped by retailer with cart URLs"
+    )
+    total_products: int = Field(..., description="Total number of products processed")
+    resolved_count: int = Field(..., description="Number of URLs successfully resolved")
+    unresolved_count: int = Field(..., description="Number of URLs that could not be resolved")
+    status: str = Field(default="success")
+    message: str = Field(default="Products processed successfully")

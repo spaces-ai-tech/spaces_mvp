@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from data_manager import data_manager
 from dotenv import load_dotenv
@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from logger_config import setup_logging
 from models import (
+    AutoSelectProductResponse,
     ImageGenerationResponse,
     ImageUploadResponse,
     ImprovementMarkersRequest,
@@ -49,6 +50,29 @@ from models import (
     ApplyStyleResponse,
     PreferredStoresRequest,
     PreferredStoresResponse,
+    # "Like These?" Product Suggestions Feature
+    PreSearchedCategory,
+    FavoriteProduct,
+    SearchRecommendationsRequest,
+    SearchRecommendationsResponse,
+    ProductSuggestionsResponse,
+    FavoriteProductsRequest,
+    FavoriteProductsResponse,
+    # Selected Trending Products for image generation
+    SelectedTrendingProduct,
+    SelectedTrendingProductsRequest,
+    SelectedTrendingProductsResponse,
+    # Flutter API Response Models
+    ColorAnalysisResponse,
+    StyleAnalysisResponse,
+    TrendingProductsResponse,
+    ColorAnalysis,
+    StyleAnalysis,
+    # Process Furniture Selection Models
+    SelectedFurnitureProduct,
+    ResolvedProduct,
+    ProcessFurnitureSelectionRequest,
+    ProcessFurnitureSelectionResponse,
 )
 
 load_dotenv()
@@ -61,7 +85,7 @@ app = FastAPI(title="AI Interior Design Agent", version="1.0.0", root_path="/api
 # Add CORS middleware for frontend communication
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # Next.js default port
+    allow_origins=["http://localhost:3000", "http://localhost:3001", "http://localhost:3002"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -985,6 +1009,342 @@ async def search_products(project_id: str):
 
 
 @app.post(
+    "/projects/{project_id}/auto-select-product",
+    response_model=AutoSelectProductResponse,
+)
+async def auto_select_product(project_id: str):
+    """
+    Auto-select the best product from search results based on:
+    - CLIP similarity score (visual match)
+    - Image quality/availability
+    - Store trust rating
+    """
+    project = data_manager.get_project(project_id)
+
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    context = ProjectContext.model_validate(project["context"])
+    products = context.product_search_results or []
+
+    if not products:
+        raise HTTPException(
+            status_code=400,
+            detail="No products available. Run product search first.",
+        )
+
+    try:
+        result = data_manager.auto_select_best_product(project_id, products)
+        return AutoSelectProductResponse(
+            project_id=project_id,
+            selected_product=result["selected_product"],
+            selection_reason=result["selection_reason"],
+            alternatives=result["alternatives"],
+            status="PRODUCT_AUTO_SELECTED",
+            message=f"Auto-selected: {result['selected_product'].get('title', 'Unknown')}",
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to auto-select product: {str(e)}",
+        )
+
+
+# ============================================================================
+# "Like These?" Product Suggestions Feature
+# ============================================================================
+
+@app.post(
+    "/projects/{project_id}/search-recommendations",
+    response_model=SearchRecommendationsResponse,
+)
+async def search_products_for_recommendations(
+    project_id: str,
+    request: SearchRecommendationsRequest
+):
+    """
+    Search for real products matching selected recommendations.
+    Called when user proceeds from Product Recommendations screen to 'Like These?' view.
+    """
+    project = data_manager.get_project(project_id)
+
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    try:
+        result = data_manager.search_products_for_recommendations(
+            project_id,
+            request.recommendations
+        )
+
+        return SearchRecommendationsResponse(
+            project_id=project_id,
+            categories=[PreSearchedCategory(**cat) for cat in result["categories"]],
+            total_products=result["total_products"],
+            status=result["status"],
+            message=result["message"],
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to search products for recommendations: {str(e)}",
+        )
+
+
+@app.get(
+    "/projects/{project_id}/product-suggestions",
+    response_model=ProductSuggestionsResponse,
+)
+async def get_product_suggestions(project_id: str):
+    """
+    Get pre-searched products organized by recommendation category.
+    """
+    project = data_manager.get_project(project_id)
+
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    try:
+        result = data_manager.get_pre_searched_suggestions(project_id)
+
+        return ProductSuggestionsResponse(
+            project_id=project_id,
+            categories=[PreSearchedCategory(**cat) for cat in result["categories"]],
+            total_products=result["total_products"],
+            overall_status=result["overall_status"],
+            message=result["message"],
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get product suggestions: {str(e)}",
+        )
+
+
+@app.post(
+    "/projects/{project_id}/favorite-products",
+    response_model=FavoriteProductsResponse,
+)
+async def set_favorite_products(
+    project_id: str,
+    request: FavoriteProductsRequest
+):
+    """
+    Save user's favorite product selections from the 'Like These?' screen.
+    """
+    project = data_manager.get_project(project_id)
+
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    try:
+        result = data_manager.set_favorite_products(
+            project_id,
+            [fav.model_dump() for fav in request.favorites]
+        )
+
+        return FavoriteProductsResponse(
+            project_id=project_id,
+            favorites_count=result["favorites_count"],
+            favorites_by_category=result["favorites_by_category"],
+            status=result["status"],
+            message=result["message"],
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to save favorite products: {str(e)}",
+        )
+
+
+@app.post(
+    "/projects/{project_id}/selected-trending-products",
+    response_model=SelectedTrendingProductsResponse,
+)
+async def set_selected_trending_products(
+    project_id: str,
+    request: SelectedTrendingProductsRequest
+):
+    """
+    Save user's selected trending products for image generation.
+    These product images will be passed to Gemini for visual representation.
+    """
+    project = data_manager.get_project(project_id)
+
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    try:
+        result = data_manager.set_selected_trending_products(
+            project_id,
+            [prod.model_dump() for prod in request.products]
+        )
+
+        return SelectedTrendingProductsResponse(
+            project_id=project_id,
+            products_count=result["products_count"],
+            products_by_category=result["products_by_category"],
+            status=result["status"],
+            message=result["message"],
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to save selected trending products: {str(e)}",
+        )
+
+
+# ============================================================================
+# Flutter API GET Endpoints
+# ============================================================================
+
+@app.get(
+    "/projects/{project_id}/color-analysis",
+    response_model=ColorAnalysisResponse,
+)
+async def get_color_analysis(project_id: str):
+    """
+    Get color analysis results for Flutter app.
+    Returns the ColorAnalysis object with palettes, assignments, and tips.
+    """
+    project = data_manager.get_project(project_id)
+
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    try:
+        context = ProjectContext.model_validate(project["context"])
+
+        color_analysis = None
+        if context.color_analysis:
+            color_analysis = ColorAnalysis.model_validate(context.color_analysis)
+
+        status = "success"
+        message = "Color analysis retrieved successfully"
+        if context.color_analysis_skipped:
+            status = "skipped"
+            message = "Color analysis was skipped by user"
+        elif not color_analysis:
+            status = "not_available"
+            message = "Color analysis has not been performed yet"
+
+        return ColorAnalysisResponse(
+            project_id=project_id,
+            color_analysis=color_analysis,
+            skipped=context.color_analysis_skipped,
+            status=status,
+            message=message,
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get color analysis: {str(e)}",
+        )
+
+
+@app.get(
+    "/projects/{project_id}/style-analysis",
+    response_model=StyleAnalysisResponse,
+)
+async def get_style_analysis(project_id: str):
+    """
+    Get style analysis results for Flutter app.
+    Returns the StyleAnalysis object with materials, furniture recommendations, and styling tips.
+    """
+    project = data_manager.get_project(project_id)
+
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    try:
+        context = ProjectContext.model_validate(project["context"])
+
+        style_analysis = None
+        if context.style_analysis:
+            style_analysis = StyleAnalysis.model_validate(context.style_analysis)
+
+        status = "success"
+        message = "Style analysis retrieved successfully"
+        if context.style_analysis_skipped:
+            status = "skipped"
+            message = "Style analysis was skipped by user"
+        elif not style_analysis:
+            status = "not_available"
+            message = "Style analysis has not been performed yet"
+
+        return StyleAnalysisResponse(
+            project_id=project_id,
+            style_analysis=style_analysis,
+            skipped=context.style_analysis_skipped,
+            status=status,
+            message=message,
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get style analysis: {str(e)}",
+        )
+
+
+@app.get(
+    "/projects/{project_id}/trending-products",
+    response_model=TrendingProductsResponse,
+)
+async def get_trending_products(project_id: str):
+    """
+    Get trending products data for Flutter app.
+    Returns pre-searched categories, selected trending products, and favorite products.
+    """
+    project = data_manager.get_project(project_id)
+
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    try:
+        context = ProjectContext.model_validate(project["context"])
+
+        # Convert pre_searched_categories dict to list
+        categories = []
+        if context.pre_searched_categories:
+            for cat_data in context.pre_searched_categories.values():
+                categories.append(PreSearchedCategory.model_validate(cat_data))
+
+        # Convert selected_trending_products
+        selected_products = []
+        if context.selected_trending_products:
+            for prod in context.selected_trending_products:
+                selected_products.append(SelectedTrendingProduct.model_validate(prod))
+
+        # Convert favorite_products
+        favorite_products = []
+        if context.favorite_products:
+            for prod in context.favorite_products:
+                favorite_products.append(FavoriteProduct.model_validate(prod))
+
+        return TrendingProductsResponse(
+            project_id=project_id,
+            categories=categories,
+            selected_products=selected_products,
+            favorite_products=favorite_products,
+            status="success",
+            message="Trending products retrieved successfully",
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get trending products: {str(e)}",
+        )
+
+
+@app.post(
     "/projects/{project_id}/product-selection",
     response_model=ProductSelectionResponse,
 )
@@ -1166,6 +1526,53 @@ async def analyze_furniture_batch(project_id: str, req: BatchFurnitureAnalysisRe
 
 
 @app.post(
+    "/projects/{project_id}/process-furniture-selection",
+    response_model=ProcessFurnitureSelectionResponse,
+)
+async def process_furniture_selection(
+    project_id: str,
+    request: ProcessFurnitureSelectionRequest
+):
+    """
+    Process selected furniture products:
+    - Resolve Google Shopping URLs to direct retailer URLs using Exa
+    - Group products by retailer
+    - Generate affiliate links and cart URLs
+
+    This endpoint is called after furniture analysis when user selects products
+    and clicks "Process Selected".
+    """
+    project = data_manager.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    try:
+        result = data_manager.process_furniture_selection(
+            project_id,
+            [p.model_dump() for p in request.selected_products]
+        )
+
+        return ProcessFurnitureSelectionResponse(
+            project_id=project_id,
+            resolved_products=[ResolvedProduct(**p) for p in result["resolved_products"]],
+            retailer_carts=[RetailerCart(**c) for c in result["retailer_carts"]],
+            total_products=result["total_products"],
+            resolved_count=result["resolved_count"],
+            unresolved_count=result["unresolved_count"],
+            status="success",
+            message=f"Processed {result['total_products']} products into {len(result['retailer_carts'])} retailer cart(s)"
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Failed to process furniture selection: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to process furniture selection: {str(e)}"
+        )
+
+
+@app.post(
     "/projects/{project_id}/reverse-search-batch",
     response_model=ReverseSearchBatchResponse,
 )
@@ -1213,7 +1620,7 @@ async def auto_detect(project_id: str, image_type: str = "product"):
 
 
 @app.get("/projects/{project_id}/replicate-segment")
-async def replicate_segment(project_id: str, image_type: str = "product", image_url: str | None = None):
+async def replicate_segment(project_id: str, image_type: str = "product", image_url: Optional[str] = None):
     """Segment with Replicate (Mask2Former). If image_url is None, fallback to YOLO."""
     try:
         result = data_manager.replicate_segment(project_id, image_type=image_type, public_image_url=image_url)

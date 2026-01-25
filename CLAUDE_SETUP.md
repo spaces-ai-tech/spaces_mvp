@@ -23,10 +23,10 @@ The `@anthropic-ai/claude-code` package has been installed locally in this proje
 
 ### 2. Configure Environment Variables
 
-Create a `.env` file in the root directory:
+Create a `.env` file in the root directory (this repo includes `env.example`):
 
 ```bash
-cp .env.example .env
+cp env.example .env
 ```
 
 Then edit the `.env` file and add your Anthropic API key:
@@ -35,18 +35,27 @@ Then edit the `.env` file and add your Anthropic API key:
 ANTHROPIC_API_KEY=sk-ant-your-actual-key-here
 ```
 
-### 3. Initialize Claude Code (Optional)
+### 3. Start Claude Code (Optional)
 
-If you want to use the Claude Code CLI tool:
+Claude Code v2.x doesn’t use an `init` command. You can just run it in this repo:
 
 ```bash
-npx @anthropic-ai/claude-code init
+npx @anthropic-ai/claude-code
 ```
 
-This will:
-- Ask for permission to access the directory
-- Set up Claude Code configuration
-- Allow you to use Claude via the CLI
+Notes:
+- The first run may ask you to **trust/allow** this directory.
+- For non-interactive usage (prints and exits), use `--print`:
+
+```bash
+npx @anthropic-ai/claude-code --print "Say hello"
+```
+
+If you’re running in a locked-down sandbox, `--dangerously-skip-permissions` can help:
+
+```bash
+npx @anthropic-ai/claude-code --dangerously-skip-permissions
+```
 
 ### 4. Test the Python Claude Client
 

@@ -1,4 +1,5 @@
 from __future__ import annotations
+import hashlib
 import json
 import logging
 import os
@@ -8,6 +9,8 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any
+
+from cache_manager import cache_manager
 
 from fastapi import UploadFile
 from logger_config import (
@@ -22,6 +25,7 @@ from serp_client import SerpClient
 from exa_client import ExaClient
 from claude_client import claude_client
 from openai_client import OpenAIClient
+from affiliate_client import AffiliateClient
 
 DATA_FILE = Path("data/projects.json")
 IMAGES_DIR = Path("data/images")
@@ -240,7 +244,11 @@ class DataManager:
             ]
 
     def _dedupe_products_by_url(self, products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Deduplicate products by normalized URL (drop query params/fragments)."""
+        """Deduplicate products by product_id (preferred) or normalized URL.
+
+        Uses product_id as primary key since Google Shopping returns redirect URLs
+        that all normalize to similar bases, causing false duplicates.
+        """
         from urllib.parse import urlparse, urlunparse
 
         def normalize(u: str) -> str:
@@ -254,8 +262,16 @@ class DataManager:
         seen = set()
         deduped: List[Dict[str, Any]] = []
         for p in products:
-            url = p.get("url") or ""
-            key = normalize(url)
+            # Prefer product_id for deduplication (unique per product from SERP)
+            product_id = p.get("id") or p.get("product_id") or ""
+            if product_id:
+                key = f"pid:{product_id}"
+            else:
+                # Fallback to URL normalization + title for uniqueness
+                url = p.get("url") or ""
+                title = p.get("title", "")[:50]  # First 50 chars of title
+                key = f"{normalize(url)}|{title.lower()}"
+
             if key and key in seen:
                 continue
             if key:
@@ -263,58 +279,208 @@ class DataManager:
             deduped.append(p)
         return deduped
 
+    def _prepare_crop_for_search(self, crop, target_size: int = 512):
+        """Prepare crop for optimal reverse image search quality.
+
+        Args:
+            crop: PIL Image crop of the furniture item
+            target_size: Minimum dimension for Google Lens (recommended 512px)
+
+        Returns:
+            Optimized PIL Image ready for reverse image search
+        """
+        from PIL import Image, ImageEnhance
+
+        # 1. Ensure minimum size for Google Lens (recommended 512px)
+        w, h = crop.size
+        if max(w, h) < target_size:
+            scale = target_size / max(w, h)
+            crop = crop.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+            print(f"   📐 Upscaled crop from {w}x{h} to {crop.size[0]}x{crop.size[1]}")
+
+        # 2. Convert to RGB (remove alpha channel if present)
+        if crop.mode != 'RGB':
+            crop = crop.convert('RGB')
+
+        # 3. Enhance contrast slightly for better feature detection
+        enhancer = ImageEnhance.Contrast(crop)
+        crop = enhancer.enhance(1.1)  # Subtle 10% contrast boost
+
+        return crop
+
     def upload_image_to_imgbb(self, image_base64: str) -> Optional[str]:
         """Upload base64 image to ImgBB and return public URL."""
         import requests
-        
+
         try:
             imgbb_key = os.getenv("IMGBB_API_KEY")
             if not imgbb_key:
                 self.logger.warning("IMGBB_API_KEY not found")
                 return None
-            
+
             url = "https://api.imgbb.com/1/upload"
             payload = {
                 "key": imgbb_key,
                 "image": image_base64,
             }
-            
+
             response = requests.post(url, data=payload, timeout=10)
             result = response.json()
-            
+
             if result.get("success"):
                 return result["data"]["url"]
-            
+
             self.logger.warning(f"ImgBB upload failed: {result}")
             return None
-            
+
         except Exception as e:
             self.logger.error(f"Error uploading to ImgBB: {e}")
             return None
 
+    def _generate_multi_queries(self, label: str, attributes: Dict) -> List[str]:
+        """Generate multiple search queries for better coverage of distinctive items.
+
+        Args:
+            label: The detected furniture label (e.g., "upholstered bed")
+            attributes: Detected attributes dict with color, material, style
+
+        Returns:
+            List of 1-3 search queries for the item
+        """
+        queries = []
+        label_lower = label.lower()
+
+        color = attributes.get("color", "")
+        material = attributes.get("material", "")
+        style = attributes.get("style", "")
+
+        # Query 1: Full descriptive (existing behavior)
+        full_parts = [p for p in [color, material, style, label] if p]
+        full_query = " ".join(full_parts).strip()
+        if full_query:
+            queries.append(full_query)
+
+        # Query 2: Feature-focused (for distinctive items like beds)
+        if "bed" in label_lower and "bedding" not in label_lower:
+            features = []
+            # Extract distinctive features from label and material
+            if "upholstered" in label_lower or "fabric" in material.lower() if material else False:
+                features.append("upholstered")
+            if "wingback" in label_lower or "wing" in label_lower:
+                features.append("wingback")
+            if "tufted" in label_lower or "channel" in label_lower:
+                features.append("channel tufted")
+            if "canopy" in label_lower:
+                features.append("canopy")
+            if "platform" in label_lower:
+                features.append("platform")
+
+            if features and color:
+                feature_query = f"{color} {' '.join(features)} bed frame"
+                if feature_query not in queries:
+                    queries.append(feature_query)
+
+        # Query 3: Style + type (e.g., "modern art deco bed")
+        if style and style.lower() not in full_query.lower():
+            style_query = f"{style} {label}"
+            if color:
+                style_query = f"{color} {style_query}"
+            if style_query not in queries:
+                queries.append(style_query)
+
+        # Query 4: Simplified (color + type only) as fallback
+        simple_query = f"{color} {label}".strip() if color else label
+        if simple_query not in queries:
+            queries.append(simple_query)
+
+        # Deduplicate and limit to 3 queries
+        seen = set()
+        unique_queries = []
+        for q in queries:
+            q_normalized = " ".join(q.lower().split())
+            if q_normalized not in seen:
+                seen.add(q_normalized)
+                unique_queries.append(q)
+
+        return unique_queries[:3]
 
     def _type_guard(self, title: str, target_type: str) -> bool:
-        """Allow only titles that match the target type family and reject decor/how-to."""
+        """Allow only titles that match the target type family and reject decor/how-to.
+
+        Uses enhanced synonym matching and hard negative filtering when feature flag is enabled.
+        """
         t = title.lower()
         tt = target_type.lower()
-        # Negative keywords for decor/how-to
-        negatives = ["decor", "how to", "ideas", "tutorial", "guide", "inspiration", "poster", "print"]
-        if any(neg in t for neg in negatives):
-            return False
 
-        # Core category mapping
-        type_map = {
-            "shelf": ["shelf", "shelving", "bookcase", "wall shelf"],
-            "console table": ["console table", "sofa table", "entry table"],
-            "table": ["table", "dining table", "coffee table", "side table", "end table", "desk"],
-            "bench": ["bench", "ottoman", "entry bench"],
-            "chair": ["chair", "armchair", "accent chair", "dining chair", "desk chair"],
-            "sofa": ["sofa", "couch", "sectional", "loveseat"],
-            "bed": ["bed", "platform bed", "bed frame", "headboard"],
-            "lamp": ["lamp", "floor lamp", "table lamp", "sconce"],
-            "storage": ["cabinet", "dresser", "sideboard", "buffet", "storage"],
-            "rug": ["rug", "runner"],
-        }
+        # Check feature flag for enhanced type guard
+        try:
+            from config import FeatureFlags, FURNITURE_SYNONYMS, HARD_NEGATIVES
+            use_enhanced = FeatureFlags.ENHANCED_TYPE_GUARD
+        except ImportError:
+            use_enhanced = False
+            FURNITURE_SYNONYMS = {}
+            HARD_NEGATIVES = []
+
+        if use_enhanced:
+            # Enhanced hard negative filtering
+            if any(neg in t for neg in HARD_NEGATIVES):
+                return False
+
+            # Extended category mapping with comprehensive synonyms
+            type_map = {
+                "shelf": ["shelf", "shelving", "bookcase", "bookshelf", "wall shelf", "floating shelf", "etagere", "étagère"],
+                "console table": ["console table", "sofa table", "entry table", "hallway table", "entryway table", "console"],
+                "table": ["table", "dining table", "coffee table", "cocktail table", "side table", "end table", "accent table", "desk"],
+                "coffee table": ["coffee table", "cocktail table", "tea table"],
+                "side table": ["side table", "end table", "accent table", "lamp table"],
+                "nightstand": ["nightstand", "bedside table", "night table", "bedside stand"],
+                "bench": ["bench", "ottoman", "entry bench", "settee", "banquette", "footstool", "pouf"],
+                "ottoman": ["ottoman", "footstool", "pouf", "hassock", "footrest"],
+                "chair": ["chair", "armchair", "accent chair", "dining chair", "desk chair", "lounge chair", "club chair", "recliner"],
+                "armchair": ["armchair", "accent chair", "lounge chair", "club chair", "arm chair"],
+                "sofa": ["sofa", "couch", "sectional", "loveseat", "settee", "sleeper sofa", "sofa bed"],
+                "sectional": ["sectional", "sectional sofa", "modular sofa", "l-shaped sofa"],
+                "bed": ["bed", "platform bed", "bed frame", "headboard", "bedframe", "sleigh bed", "canopy bed"],
+                "lamp": ["lamp", "floor lamp", "table lamp", "desk lamp", "sconce", "light", "lighting"],
+                "floor lamp": ["floor lamp", "standing lamp", "torchiere", "arc lamp"],
+                "table lamp": ["table lamp", "desk lamp", "bedside lamp"],
+                "dresser": ["dresser", "chest of drawers", "bureau", "chest", "highboy", "lowboy"],
+                "cabinet": ["cabinet", "sideboard", "buffet", "credenza", "hutch", "cupboard", "armoire"],
+                "storage": ["cabinet", "dresser", "sideboard", "buffet", "storage", "credenza", "chest"],
+                "tv stand": ["tv stand", "media console", "entertainment center", "media cabinet", "tv console", "media stand"],
+                "rug": ["rug", "area rug", "runner", "carpet", "mat"],
+                "desk": ["desk", "writing desk", "computer desk", "work desk", "secretary desk", "office desk"],
+                "stool": ["stool", "bar stool", "counter stool", "barstool"],
+            }
+
+            # Add dynamic synonyms from config
+            for key, synonyms in FURNITURE_SYNONYMS.items():
+                if key not in type_map:
+                    type_map[key] = [key] + synonyms
+                else:
+                    # Merge with existing
+                    existing = set(type_map[key])
+                    existing.update(synonyms)
+                    type_map[key] = list(existing)
+
+        else:
+            # Original implementation (fallback)
+            negatives = ["decor", "how to", "ideas", "tutorial", "guide", "inspiration", "poster", "print"]
+            if any(neg in t for neg in negatives):
+                return False
+
+            type_map = {
+                "shelf": ["shelf", "shelving", "bookcase", "wall shelf"],
+                "console table": ["console table", "sofa table", "entry table"],
+                "table": ["table", "dining table", "coffee table", "side table", "end table", "desk"],
+                "bench": ["bench", "ottoman", "entry bench"],
+                "chair": ["chair", "armchair", "accent chair", "dining chair", "desk chair"],
+                "sofa": ["sofa", "couch", "sectional", "loveseat"],
+                "bed": ["bed", "platform bed", "bed frame", "headboard"],
+                "lamp": ["lamp", "floor lamp", "table lamp", "sconce"],
+                "storage": ["cabinet", "dresser", "sideboard", "buffet", "storage"],
+                "rug": ["rug", "runner"],
+            }
 
         # Find matched family
         for family, keywords in type_map.items():
@@ -1414,9 +1580,19 @@ Return exactly 6 recommendations that are distinct and complementary to each oth
                     continue
                 if not p.get("is_product_page", True):
                     continue
+                # Filter out products without valid images
+                images = p.get("images", [])
+                if not images or len(images) == 0:
+                    continue
+                # Check first image is valid (not placeholder)
+                first_image = images[0] if images else ""
+                bad_patterns = ["placeholder", ".svg", "no-image", "default", "blank", "empty", "missing"]
+                if any(pat in first_image.lower() for pat in bad_patterns):
+                    continue
                 filtered_products.append(p)
 
-            filtered_products = filtered_products[:8]
+            # Limit to 4 quality products with images
+            filtered_products = filtered_products[:4]
 
             # Update the project context with search results
             old_status = projects[project_id]["status"]
@@ -1463,6 +1639,1077 @@ Return exactly 6 recommendations that are distinct and complementary to each oth
             )
             # Log failed search call
             log_external_api_call("search", "product_search", 0, False)
+            raise
+
+    # ========================================================================
+    # "Like These?" Product Suggestions Feature
+    # ========================================================================
+
+    # Decor-specific search templates for better product results
+    DECOR_SEARCH_TEMPLATES = {
+        "wall art": "{style} wall art canvas print framed artwork home decor",
+        "art": "{style} wall art canvas print framed artwork home decor",
+        "geometric art": "{style} geometric wall art canvas print abstract modern",
+        "rug": "{style} area rug carpet floor mat {color}",
+        "geometric rug": "{style} geometric pattern area rug modern carpet",
+        "vase": "{style} decorative vase ceramic glass flower vase home decor",
+        "lamp": "{style} lamp lighting fixture {color}",
+        "floor lamp": "{style} floor lamp standing lamp modern lighting",
+        "table lamp": "{style} table lamp desk lamp bedside lighting",
+        "mirror": "{style} wall mirror decorative mirror home decor",
+        "plant": "artificial plant faux greenery indoor plant decor",
+        "throw pillow": "{style} throw pillow decorative cushion {color}",
+        "curtain": "{style} curtain drapes window treatment {color}",
+        "shelf": "{style} wall shelf floating shelf storage decor",
+        "clock": "{style} wall clock decorative clock modern",
+    }
+
+    def _select_best_recommendations(
+        self,
+        context: ProjectContext,
+        max_count: int = 2
+    ) -> List[str]:
+        """
+        Auto-select the best recommendations based on style analysis.
+        Prioritizes items that match the selected design style.
+
+        Args:
+            context: Project context with recommendations and analysis
+            max_count: Maximum recommendations to select (default 2)
+
+        Returns:
+            List of top recommendations based on style match
+        """
+        recommendations = context.product_recommendations or []
+        if len(recommendations) <= max_count:
+            return recommendations
+
+        # Get style furniture recommendations if available
+        style_items = []
+        if context.style_analysis and isinstance(context.style_analysis, dict):
+            furniture_recs = context.style_analysis.get("furniture_recommendations", [])
+            for rec in furniture_recs:
+                if isinstance(rec, dict):
+                    item_type = rec.get("item_type", "").lower()
+                    if item_type:
+                        style_items.append(item_type)
+
+        # Score each recommendation
+        scored = []
+        for rec in recommendations:
+            rec_lower = rec.lower()
+            score = 0
+
+            # Check if matches style furniture recommendations
+            for style_item in style_items:
+                if style_item in rec_lower:
+                    score += 10  # High priority for style match
+
+            # Boost high-impact furniture items
+            high_impact = ["sofa", "bed", "table", "desk", "chair", "bookcase", "dresser"]
+            for item in high_impact:
+                if item in rec_lower:
+                    score += 5
+
+            # Boost decor items for visual interest
+            decor_items = ["art", "lamp", "rug", "mirror", "plant"]
+            for item in decor_items:
+                if item in rec_lower:
+                    score += 3
+
+            scored.append((rec, score))
+
+        # Sort by score descending and take top N
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return [rec for rec, score in scored[:max_count]]
+
+    def _validate_product_links(self, products: List[Dict], max_validate: int = 5) -> List[Dict]:
+        """Validate that product URLs lead to actual product pages."""
+        import requests
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def check_link(product):
+            url = product.get("url", "")
+            if not url:
+                return product, False
+            try:
+                # Quick HEAD request to check if URL works
+                resp = requests.head(url, timeout=3, allow_redirects=True)
+                # Check for valid response and not error page
+                is_valid = resp.status_code == 200
+                product["link_validated"] = is_valid
+                return product, is_valid
+            except:
+                product["link_validated"] = False
+                return product, False
+
+        validated = []
+        try:
+            with ThreadPoolExecutor(max_workers=5) as executor:
+                futures = {executor.submit(check_link, p): p for p in products[:max_validate]}
+                for future in as_completed(futures, timeout=10):
+                    try:
+                        product, is_valid = future.result()
+                        if is_valid:
+                            validated.append(product)
+                    except:
+                        pass
+        except:
+            # If validation fails entirely, return original products
+            return products
+
+        # Add remaining unvalidated products
+        validated.extend(products[max_validate:])
+        return validated
+
+    def _filter_products_with_images(
+        self,
+        products: List[Dict[str, Any]],
+        min_count: int = 4
+    ) -> List[Dict[str, Any]]:
+        """
+        Filter products ensuring they have valid images.
+        Checks multiple image fields and normalizes to image_url.
+        Always returns at least min_count products, supplementing with
+        non-image products if needed.
+        """
+        def get_image(p):
+            """Get best available image from multiple possible fields."""
+            return (
+                p.get("image_url") or
+                p.get("thumbnail") or
+                (p.get("images") or [None])[0] or
+                p.get("image")
+            )
+
+        # Categorize products by image quality
+        with_good_images = []
+        with_any_images = []
+        without_images = []
+
+        bad_patterns = [
+            "placeholder", ".svg", "no-image", "default",
+            "blank", "empty", "missing"
+        ]
+
+        for p in products:
+            img = get_image(p)
+            if img and len(img) > 10:
+                # Normalize to image_url for consistent frontend access
+                p["image_url"] = img
+                is_bad = any(pat in img.lower() for pat in bad_patterns)
+                if not is_bad:
+                    with_good_images.append(p)
+                else:
+                    with_any_images.append(p)
+            else:
+                without_images.append(p)
+
+        # Log image quality breakdown
+        print(f"[IMAGE_FILTER] Input: {len(products)} products")
+        print(f"[IMAGE_FILTER]   - Good images: {len(with_good_images)}")
+        print(f"[IMAGE_FILTER]   - Bad pattern images: {len(with_any_images)}")
+        print(f"[IMAGE_FILTER]   - No images: {len(without_images)}")
+
+        # Build result list prioritizing good images
+        result = with_good_images[:min_count]
+
+        # If we need more, add from other categories
+        if len(result) < min_count:
+            needed = min_count - len(result)
+            result.extend(with_any_images[:needed])
+
+        if len(result) < min_count:
+            needed = min_count - len(result)
+            result.extend(without_images[:needed])
+
+        print(f"[IMAGE_FILTER] Output: {len(result)} products (min_count={min_count})")
+        return result
+
+    def _curate_products_with_ai(
+        self,
+        products: List[Dict[str, Any]],
+        category: str,
+        style: str = "",
+        room_type: str = "",
+        max_products: int = 8
+    ) -> List[Dict[str, Any]]:
+        """
+        Use Gemini Vision to evaluate and rank products by visual quality and aesthetics.
+        
+        Evaluates:
+        1. Visual quality - Image clarity, professional photography
+        2. Design aesthetic - Modern, premium look vs generic
+        3. Style match - How well it fits the requested style/room
+        
+        Args:
+            products: List of product dicts with image_url
+            category: Product category (e.g., "accent chair", "wall art")
+            style: Requested style (e.g., "modern", "mid-century")
+            room_type: Room type for context (e.g., "living room", "bedroom")
+            max_products: Maximum products to return
+            
+        Returns:
+            Products sorted by AI quality score, filtered below threshold
+        """
+        from config import AI_PRODUCT_CURATION, QUALITY_RETAILER_SCORES
+        import requests
+        from io import BytesIO
+        from PIL import Image
+        import base64
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        
+        if not AI_PRODUCT_CURATION.get("enabled", True):
+            self.logger.info("AI product curation disabled, returning unfiltered products")
+            return products[:max_products]
+        
+        if not products:
+            return []
+        
+        # Limit products to evaluate (cost control)
+        max_eval = AI_PRODUCT_CURATION.get("max_products_to_evaluate", 16)
+        products_to_eval = products[:max_eval]
+        
+        self.logger.info(f"AI curation: evaluating {len(products_to_eval)} products for '{category}'")
+        print(f"[AI_CURATION] Starting AI curation for {len(products_to_eval)} products")
+        print(f"[AI_CURATION]   Category: {category}, Style: {style}, Room: {room_type}")
+        
+        # Step 1: Download product images in parallel
+        def download_image(product: Dict) -> tuple:
+            """Download and encode product image."""
+            image_url = product.get("image_url", "") or ""
+            if not image_url or len(image_url) < 10:
+                return product, None
+            try:
+                response = requests.get(image_url, timeout=5)
+                if response.status_code == 200:
+                    img = Image.open(BytesIO(response.content))
+                    # Skip tiny images
+                    min_dim = AI_PRODUCT_CURATION.get("min_image_dimension", 200)
+                    if img.width < min_dim or img.height < min_dim:
+                        return product, None
+                    # Resize to save bandwidth
+                    img.thumbnail((400, 400))
+                    buffer = BytesIO()
+                    img.convert("RGB").save(buffer, format="JPEG", quality=80)
+                    img_b64 = base64.b64encode(buffer.getvalue()).decode()
+                    return product, img_b64
+            except Exception as e:
+                self.logger.warning(f"Failed to download image {image_url[:50]}: {e}")
+            return product, None
+        
+        # Download images in parallel
+        products_with_images = []
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = {executor.submit(download_image, p): p for p in products_to_eval}
+            for future in as_completed(futures):
+                product, img_b64 = future.result()
+                if img_b64:
+                    products_with_images.append((product, img_b64))
+        
+        if not products_with_images:
+            self.logger.warning("AI curation: No products had valid images, returning original list")
+            return products[:max_products]
+        
+        print(f"[AI_CURATION] Downloaded {len(products_with_images)} product images")
+        
+        # Step 2: Get store quality scores as initial boost
+        for product, _ in products_with_images:
+            store = (product.get("store") or "").lower()
+            store_score = QUALITY_RETAILER_SCORES.get(store, QUALITY_RETAILER_SCORES.get("default", 0.7))
+            product["_store_quality"] = store_score
+        
+        # Step 3: Use Gemini to evaluate batches
+        batch_size = AI_PRODUCT_CURATION.get("batch_size", 8)
+        all_scored = []
+        
+        for batch_start in range(0, len(products_with_images), batch_size):
+            batch = products_with_images[batch_start:batch_start + batch_size]
+            
+            try:
+                scored_batch = self._evaluate_product_batch_with_gemini(
+                    batch, category, style, room_type
+                )
+                all_scored.extend(scored_batch)
+            except Exception as e:
+                self.logger.error(f"Gemini batch evaluation failed: {e}")
+                # Fallback: use store quality score only
+                for product, _ in batch:
+                    product["_ai_score"] = product.get("_store_quality", 0.7)
+                    all_scored.append(product)
+        
+        # Step 4: Sort by combined score and filter
+        min_score = AI_PRODUCT_CURATION.get("min_quality_score", 0.5)
+        
+        def get_final_score(p):
+            ai_score = p.get("_ai_score", 0.5)
+            store_score = p.get("_store_quality", 0.7)
+            # Weighted combination: AI 70%, Store 30%
+            return ai_score * 0.7 + store_score * 0.3
+        
+        # Add final score and sort
+        for p in all_scored:
+            p["_final_score"] = get_final_score(p)
+        
+        all_scored.sort(key=lambda p: p.get("_final_score", 0), reverse=True)
+        
+        # Filter and limit
+        filtered = [p for p in all_scored if p.get("_final_score", 0) >= min_score]
+        
+        # Ensure minimum products (don't filter too aggressively)
+        if len(filtered) < 3 and len(all_scored) >= 3:
+            filtered = all_scored[:max(3, len(filtered))]
+        
+        result = filtered[:max_products]
+        
+        # Clean up internal score fields from output (optional)
+        for p in result:
+            p.pop("_store_quality", None)
+            p.pop("_ai_score", None)
+            p.pop("_final_score", None)
+        
+        print(f"[AI_CURATION] Final result: {len(result)} curated products")
+        self.logger.info(f"AI curation complete: {len(result)} products returned")
+        
+        return result
+    
+    def _evaluate_product_batch_with_gemini(
+        self,
+        batch: List[tuple],  # List of (product, img_b64) tuples
+        category: str,
+        style: str,
+        room_type: str
+    ) -> List[Dict[str, Any]]:
+        """
+        Evaluate a batch of products using Gemini Vision.
+        
+        Returns products with _ai_score added.
+        """
+        from pydantic import BaseModel, Field
+        from typing import List as TypeList
+        
+        if not batch:
+            return []
+        
+        # Build prompt with product info
+        class ProductScore(BaseModel):
+            index: int = Field(description="Product index (0-based)")
+            quality_score: float = Field(
+                description="Visual/design quality score 0.0-1.0. Consider: image clarity, "
+                "professional photography, modern/premium aesthetic, uniqueness"
+            )
+            style_match: float = Field(
+                description="How well it matches the requested style 0.0-1.0"
+            )
+            reasoning: str = Field(description="Brief reason for scores")
+        
+        class ProductEvaluationResponse(BaseModel):
+            scores: TypeList[ProductScore]
+        
+        # Prepare images and product info for prompt
+        image_parts = []
+        product_info = []
+        for i, (product, img_b64) in enumerate(batch):
+            image_parts.append({
+                "inline_data": {
+                    "mime_type": "image/jpeg",
+                    "data": img_b64
+                }
+            })
+            title = product.get("title", "Unknown")[:80]
+            store = product.get("store", "Unknown")
+            product_info.append(f"Product {i}: {title} (from {store})")
+        
+        style_desc = style if style else "modern, aesthetic"
+        room_desc = room_type if room_type else "any room"
+        
+        prompt = f"""Evaluate these {len(batch)} product images for a {category} in a {room_desc}.
+Requested style: {style_desc}
+
+Products:
+{chr(10).join(product_info)}
+
+For each product, score:
+1. quality_score (0.0-1.0): Visual quality - professional photography, image clarity, premium/modern look, not generic/cheap-looking
+2. style_match (0.0-1.0): How well it matches the "{style_desc}" style and would fit in a {room_desc}
+
+Score honestly - reject poor quality images (blurry, amateur), generic/basic designs, items that don't match the style.
+Prefer: Clear photos, unique designs, trending aesthetics, professional product shots.
+"""
+        
+        try:
+            result = self.gemini_client.analyze_images_with_vision(
+                prompt=prompt,
+                pydantic_model=ProductEvaluationResponse,
+                image_parts=image_parts,
+                system_message="You are an expert interior designer evaluating product quality and style. Be critical - only high-quality, aesthetically pleasing products deserve scores above 0.7."
+            )
+            
+            # Map scores back to products
+            score_map = {s.index: s for s in result.scores}
+            scored_products = []
+            
+            for i, (product, _) in enumerate(batch):
+                if i in score_map:
+                    score_data = score_map[i]
+                    # Combine quality and style match
+                    from config import AI_PRODUCT_CURATION
+                    weights = AI_PRODUCT_CURATION.get("score_weights", {})
+                    quality_weight = weights.get("visual_quality", 0.35) + weights.get("design_aesthetic", 0.35)
+                    style_weight = weights.get("style_match", 0.30)
+                    
+                    combined = (score_data.quality_score * quality_weight + 
+                               score_data.style_match * style_weight)
+                    product["_ai_score"] = combined
+                    print(f"[AI_CURATION]   Product {i}: quality={score_data.quality_score:.2f}, "
+                          f"style={score_data.style_match:.2f}, combined={combined:.2f}")
+                else:
+                    product["_ai_score"] = 0.5  # Default if not scored
+                
+                scored_products.append(product)
+            
+            return scored_products
+            
+        except Exception as e:
+            self.logger.error(f"Gemini product evaluation failed: {e}")
+            # Fallback: return with default scores
+            for product, _ in batch:
+                product["_ai_score"] = 0.5
+            return [p for p, _ in batch]
+
+    def auto_select_best_product(
+        self,
+        project_id: str,
+        products: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """
+        Auto-select the best product from search results based on scoring criteria:
+        - CLIP similarity score (visual match to room)
+        - Image availability and quality
+        - Store trust rating
+        - Price availability
+
+        Returns the selected product and alternatives.
+        """
+        if not products:
+            raise ValueError("No products to select from")
+
+        # Score each product
+        scored_products = []
+        for p in products:
+            score = 0.0
+            reasons = []
+
+            # 1. CLIP similarity score (highest weight)
+            similarity = p.get("similarity_score", 0) or p.get("relevance_score", 0.5)
+            score += similarity * 50  # Up to 50 points
+            if similarity >= 0.8:
+                reasons.append("high visual match")
+
+            # 2. Image availability (required)
+            images = p.get("images", [])
+            if images and len(images) > 0 and len(images[0]) > 10:
+                score += 20  # 20 points for having image
+                reasons.append("clear product image")
+            else:
+                score -= 100  # Heavily penalize no image
+
+            # 3. Store trust rating
+            store_trust = p.get("store_trust", 0.5)
+            score += store_trust * 15  # Up to 15 points
+            if store_trust >= 0.85:
+                reasons.append("trusted retailer")
+
+            # 4. Price availability
+            price = p.get("price")
+            if price and price > 0:
+                score += 10  # 10 points for having price
+                reasons.append("price available")
+
+            # 5. Rating bonus
+            rating = p.get("rating", 0)
+            if rating and rating >= 4.0:
+                score += 5
+                reasons.append(f"highly rated ({rating})")
+
+            scored_products.append({
+                "product": p,
+                "score": score,
+                "reasons": reasons
+            })
+
+        # Sort by score descending
+        scored_products.sort(key=lambda x: x["score"], reverse=True)
+
+        # Best product is first
+        best = scored_products[0]
+        selected_product = best["product"]
+        selection_reason = ", ".join(best["reasons"]) if best["reasons"] else "best overall match"
+
+        # Alternatives are the rest
+        alternatives = [sp["product"] for sp in scored_products[1:4]]  # Up to 3 alternatives
+
+        # Store selection in project context
+        projects = self._load_projects()
+        if project_id in projects:
+            context = projects[project_id].get("context", {})
+            context["auto_selected_product"] = selected_product
+            context["auto_selected_reason"] = selection_reason
+            projects[project_id]["context"] = context
+            self._save_projects(projects)
+
+        return {
+            "selected_product": selected_product,
+            "selection_reason": selection_reason,
+            "alternatives": alternatives
+        }
+
+    @log_api_call("search_products_for_recommendations")
+    def search_products_for_recommendations(
+        self,
+        project_id: str,
+        recommendations: List[str]
+    ) -> Dict[str, Any]:
+        """
+        Search for real products for each selected recommendation.
+        Uses SERP API / Exa to find products from the web in parallel.
+        Auto-selects top 2 recommendations if more are provided.
+
+        Args:
+            project_id: The project ID
+            recommendations: List of recommendations like ["Add Velvet Bed", "Hang Geometric Art"]
+
+        Returns:
+            Dict with categories, each containing products
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from datetime import datetime
+
+        try:
+            self.logger.info(
+                "Starting product search for recommendations",
+                extra={"project_id": project_id, "recommendations": recommendations}
+            )
+
+            projects = self._load_projects()
+            if project_id not in projects:
+                raise ValueError(f"Project {project_id} not found")
+
+            context = ProjectContext.model_validate(projects[project_id]["context"])
+
+            if not self.serp_client and not self.exa_client:
+                raise ValueError(
+                    "No product search client available - configure SERP_API_KEY or EXA_API_KEY"
+                )
+
+            # Limit to 2 categories, auto-select best if more provided
+            if len(recommendations) > 2:
+                recommendations = self._select_best_recommendations(context, max_count=2)
+                self.logger.info(f"Auto-selected top 2 recommendations: {recommendations}")
+
+            # Search for products for each recommendation in parallel
+            categories = []
+            MAX_WORKERS = 4
+            MAX_PRODUCTS_TO_FETCH = 30  # Fetch more to ensure 4+ survive filtering
+            MIN_PRODUCTS_WITH_IMAGES = 4
+
+            def search_single_recommendation(recommendation: str) -> Dict[str, Any]:
+                """Search products for a single recommendation using multiple query variations."""
+                try:
+                    # Clean up the recommendation for query building
+                    rec_lower = recommendation.lower()
+                    for prefix in ["add ", "change ", "replace ", "install ", "hang ", "place "]:
+                        if rec_lower.startswith(prefix):
+                            rec_lower = rec_lower[len(prefix):]
+                            break
+
+                    # Get style name for queries
+                    style_name = ""
+                    if context.style_analysis and isinstance(context.style_analysis, dict):
+                        style_name = context.style_analysis.get("style_name", "modern")
+
+                    # Generate multiple query variations for better coverage
+                    query_variations = [
+                        f"trending {rec_lower}",
+                        f"best {rec_lower} 2024",
+                        f"popular {rec_lower}",
+                        f"{style_name} {rec_lower}" if style_name else f"modern {rec_lower}",
+                    ]
+
+                    products: List[Dict[str, Any]] = []
+                    primary_query = query_variations[0]  # For logging
+
+                    # Search with each query variation
+                    for query in query_variations:
+                        # Add negative keywords to exclude DIY plans and non-product content
+                        full_query = f"{query} -ideas -inspiration -diy -tutorial -plans -woodworking -blueprint -project -pattern -PDF"
+
+                        # SERP Google Shopping
+                        serp_count = 0
+                        if self.serp_client:
+                            try:
+                                serp_products = self.serp_client.search_and_analyze_products(
+                                    query=full_query,
+                                    space_type=context.space_type or "general",
+                                    num_results=10,  # 10 per query variation
+                                )
+                                serp_count = len(serp_products)
+                                print(f"[PRODUCT_SEARCH] SERP returned {serp_count} products for variation: '{query}'")
+                                for product in serp_products:
+                                    product["source_api"] = "serp"
+                                    product["search_query"] = query
+                                products.extend(serp_products)
+                            except Exception as e:
+                                print(f"[PRODUCT_SEARCH] SERP failed for '{query}': {e}")
+                                self.logger.warning(f"SERP search failed for query '{query}': {e}")
+
+                        # Exa semantic search
+                        exa_count = 0
+                        if self.exa_client:
+                            try:
+                                exa_products = self.exa_client.search_and_analyze_products(
+                                    query=full_query,
+                                    space_type=context.space_type or "general",
+                                    num_results=8,
+                                    similar_per_seed=2,
+                                )
+                                exa_count = len(exa_products)
+                                print(f"[PRODUCT_SEARCH] Exa returned {exa_count} products for variation: '{query}'")
+                                for product in exa_products:
+                                    product["source_api"] = "exa"
+                                    product["search_query"] = query
+                                products.extend(exa_products)
+                            except Exception as e:
+                                print(f"[PRODUCT_SEARCH] Exa failed for '{query}': {e}")
+                                self.logger.warning(f"Exa search failed for query '{query}': {e}")
+
+                    # Log product collection stats
+                    with_images = sum(1 for p in products if p.get("images") or p.get("thumbnail") or p.get("image_url") or p.get("image"))
+                    print(f"[PRODUCT_SEARCH] === Summary for '{recommendation}' ===")
+                    print(f"[PRODUCT_SEARCH] Total collected: {len(products)} products from {len(query_variations)} query variations")
+                    print(f"[PRODUCT_SEARCH] Products with images: {with_images}/{len(products)}")
+                    self.logger.info(f"Collected {len(products)} products from {len(query_variations)} query variations for '{recommendation}'")
+                    self.logger.info(f"  - Products with images: {with_images}/{len(products)}")
+
+                    # Deduplicate
+                    before_dedup = len(products)
+                    products = self._dedupe_products_by_url(products)
+                    print(f"[PRODUCT_SEARCH] After dedup: {len(products)} (removed {before_dedup - len(products)} duplicates)")
+                    self.logger.info(f"  - After dedup: {len(products)} (removed {before_dedup - len(products)} duplicates)")
+
+                    # Convert to PreSearchedProduct format with better image extraction
+                    formatted_products = []
+                    for p in products:
+                        # Try multiple image sources
+                        image_url = ""
+                        images = p.get("images", [])
+                        if images and len(images) > 0:
+                            image_url = images[0]
+                        elif p.get("thumbnail"):
+                            image_url = p.get("thumbnail")
+                        elif p.get("image"):
+                            image_url = p.get("image")
+                        elif p.get("image_url"):
+                            image_url = p.get("image_url")
+
+                        formatted_products.append({
+                            "url": p.get("url", p.get("product_link", p.get("link", ""))),
+                            "title": p.get("title", ""),
+                            "image_url": image_url,
+                            "store": p.get("store", p.get("source", "Unknown")),
+                            "price_str": p.get("price_str", str(p.get("price", "")) if p.get("price") else ""),
+                            "price": p.get("price") if isinstance(p.get("price"), (int, float)) else None,
+                            "similarity_score": p.get("similarity_score"),
+                        })
+
+                    # Filter to products with valid images, ensure minimum 8 for AI curation
+                    before_filter = len(formatted_products)
+                    formatted_products = self._filter_products_with_images(
+                        formatted_products,
+                        min_count=8  # Get more candidates for AI curation
+                    )
+                    print(f"[PRODUCT_SEARCH] After image filter: {len(formatted_products)} (from {before_filter} formatted)")
+                    self.logger.info(f"  - After image filter: {len(formatted_products)} (from {before_filter} formatted)")
+
+                    # AI Curation: Use Gemini to score and rank products by visual quality
+                    try:
+                        from config import AI_PRODUCT_CURATION
+                        if AI_PRODUCT_CURATION.get("enabled", True) and len(formatted_products) >= 4:
+                            print(f"[AI_CURATION] Curating {len(formatted_products)} products for '{recommendation}'")
+                            curated_products = self._curate_products_with_ai(
+                                products=formatted_products,
+                                category=rec_lower,
+                                style=style_name,
+                                room_type=context.space_type or "room",
+                                max_products=6  # Return up to 6 curated options
+                            )
+                            if curated_products and len(curated_products) >= 2:
+                                formatted_products = curated_products
+                                print(f"[AI_CURATION] ✅ AI curation returned {len(formatted_products)} products")
+                            else:
+                                print(f"[AI_CURATION] ⚠️ AI curation returned insufficient products, using original list")
+                                formatted_products = formatted_products[:6]
+                        else:
+                            formatted_products = formatted_products[:6]
+                    except Exception as ai_err:
+                        print(f"[AI_CURATION] ❌ AI curation failed: {ai_err}, using original products")
+                        self.logger.warning(f"AI curation failed: {ai_err}")
+                        formatted_products = formatted_products[:6]
+
+                    # Ensure minimum 4 products
+                    if len(formatted_products) < 4:
+                        print(f"[PRODUCT_SEARCH] ⚠️ Only {len(formatted_products)} products, need at least 4")
+                        # Products were already filtered, just warn
+                    
+                    print(f"[PRODUCT_SEARCH] FINAL: {len(formatted_products)} products for '{recommendation}'")
+                    print(f"[PRODUCT_SEARCH] ========================================")
+                    self.logger.info(f"  - Final products for '{recommendation}': {len(formatted_products)}")
+
+                    return {
+                        "recommendation": recommendation,
+                        "search_query": primary_query,
+                        "status": "complete",
+                        "products": formatted_products,
+                        "searched_at": datetime.now().isoformat(),
+                        "error_message": None,
+                    }
+
+                except Exception as e:
+                    self.logger.error(f"Search failed for recommendation '{recommendation}': {e}")
+                    return {
+                        "recommendation": recommendation,
+                        "search_query": "",
+                        "status": "error",
+                        "products": [],
+                        "searched_at": datetime.now().isoformat(),
+                        "error_message": str(e),
+                    }
+
+            # Execute searches in parallel
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                futures = {
+                    executor.submit(search_single_recommendation, rec): rec
+                    for rec in recommendations
+                }
+
+                for future in as_completed(futures):
+                    result = future.result()
+                    categories.append(result)
+
+            # Sort categories to match input order
+            rec_order = {rec: i for i, rec in enumerate(recommendations)}
+            categories.sort(key=lambda c: rec_order.get(c["recommendation"], 999))
+
+            # Store in context
+            pre_searched = {cat["recommendation"]: cat for cat in categories}
+            updated_context = context.model_copy(
+                update={"pre_searched_categories": pre_searched}
+            )
+            projects[project_id]["context"] = updated_context.model_dump()
+            self._save_projects(projects)
+
+            total_products = sum(len(cat["products"]) for cat in categories)
+
+            self.logger.info(
+                "Product search for recommendations completed",
+                extra={
+                    "project_id": project_id,
+                    "categories": len(categories),
+                    "total_products": total_products,
+                }
+            )
+
+            return {
+                "project_id": project_id,
+                "categories": categories,
+                "total_products": total_products,
+                "ai_selected": len(recommendations) <= 2,  # Indicates AI selection was used
+                "status": "success",
+                "message": f"Found {total_products} products across {len(categories)} categories",
+            }
+
+        except Exception as e:
+            self.logger.error(
+                f"Failed to search products for recommendations: {str(e)}",
+                extra={"project_id": project_id},
+                exc_info=True,
+            )
+            raise
+
+    def _generate_search_query_for_recommendation(
+        self,
+        context: ProjectContext,
+        recommendation: str
+    ) -> str:
+        """
+        Generate a search query for a single recommendation.
+        Uses decor templates for better results on decor items.
+        Uses context (color scheme, style) to optimize the query.
+        """
+        # Clean up the recommendation
+        rec_lower = recommendation.lower()
+        for prefix in ["add ", "change ", "replace ", "install ", "hang ", "place "]:
+            if rec_lower.startswith(prefix):
+                rec_lower = rec_lower[len(prefix):]
+                break
+
+        # Get style name for templates
+        style_name = ""
+        if context.style_analysis and isinstance(context.style_analysis, dict):
+            style_name = context.style_analysis.get("style_name", "modern")
+
+        # Get color for templates
+        color = ""
+        if context.color_analysis and isinstance(context.color_analysis, dict):
+            accent_colors = context.color_analysis.get("accent_colors", [])
+            if accent_colors and isinstance(accent_colors, list) and len(accent_colors) > 0:
+                first_color = accent_colors[0]
+                if isinstance(first_color, dict):
+                    color = first_color.get("description", "")[:15]
+
+        # Check if this is a decor item with a template
+        search_query = None
+        for item_key, template in self.DECOR_SEARCH_TEMPLATES.items():
+            if item_key in rec_lower:
+                search_query = template.format(
+                    style=style_name,
+                    color=color,
+                    size="",
+                    type=""
+                ).strip()
+                # Clean up double spaces
+                while "  " in search_query:
+                    search_query = search_query.replace("  ", " ")
+                break
+
+        # If no template matched, use default approach
+        if not search_query:
+            query_parts = [rec_lower]
+            if style_name:
+                query_parts.insert(0, style_name.lower())
+            if color:
+                query_parts.append(color.lower())
+            search_query = " ".join(query_parts)
+
+        # Add "trending" prefix for better product discovery
+        search_query = f"trending {search_query}"
+
+        # Add negative keywords to filter out non-products
+        # More aggressive filtering for decor items
+        negative_keywords = " -ideas -inspiration -\"how to\" -diy -tutorial -book -magazine -pattern"
+        search_query += negative_keywords
+
+        self.logger.info(f"Generated search query for '{recommendation}': {search_query}")
+
+        return search_query[:120]  # Limit query length
+
+    def get_pre_searched_suggestions(self, project_id: str) -> Dict[str, Any]:
+        """
+        Get all pre-searched product suggestions organized by category.
+
+        Returns:
+            Dict with categories, status, and message
+        """
+        try:
+            projects = self._load_projects()
+            if project_id not in projects:
+                raise ValueError(f"Project {project_id} not found")
+
+            context = ProjectContext.model_validate(projects[project_id]["context"])
+
+            pre_searched = context.pre_searched_categories or {}
+
+            if not pre_searched:
+                return {
+                    "project_id": project_id,
+                    "categories": [],
+                    "total_products": 0,
+                    "overall_status": "empty",
+                    "message": "No products have been searched yet",
+                }
+
+            categories = list(pre_searched.values())
+            total_products = sum(len(cat.get("products", [])) for cat in categories)
+
+            # Determine overall status
+            statuses = [cat.get("status", "pending") for cat in categories]
+            if all(s == "complete" for s in statuses):
+                overall_status = "all_complete"
+            elif all(s == "error" for s in statuses):
+                overall_status = "all_error"
+            elif any(s == "pending" for s in statuses):
+                overall_status = "some_pending"
+            else:
+                overall_status = "mixed"
+
+            return {
+                "project_id": project_id,
+                "categories": categories,
+                "total_products": total_products,
+                "overall_status": overall_status,
+                "message": f"Found {total_products} products across {len(categories)} categories",
+            }
+
+        except Exception as e:
+            self.logger.error(
+                f"Failed to get pre-searched suggestions: {str(e)}",
+                extra={"project_id": project_id},
+                exc_info=True,
+            )
+            raise
+
+    def set_favorite_products(
+        self,
+        project_id: str,
+        favorites: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """
+        Save user's selected favorite products from the 'Like These?' screen.
+        These will be used in image generation and purchase flow.
+
+        Args:
+            project_id: The project ID
+            favorites: List of favorite product dicts with category, url, title, image_url, store
+
+        Returns:
+            Confirmation with counts
+        """
+        try:
+            self.logger.info(
+                "Saving favorite products",
+                extra={"project_id": project_id, "count": len(favorites)}
+            )
+
+            projects = self._load_projects()
+            if project_id not in projects:
+                raise ValueError(f"Project {project_id} not found")
+
+            context = ProjectContext.model_validate(projects[project_id]["context"])
+
+            # Validate and store favorites
+            validated_favorites = []
+            for fav in favorites:
+                validated_favorites.append({
+                    "category": fav.get("category", ""),
+                    "url": fav.get("url", ""),
+                    "title": fav.get("title", ""),
+                    "image_url": fav.get("image_url", ""),
+                    "store": fav.get("store", ""),
+                    "price_str": fav.get("price_str"),
+                })
+
+            updated_context = context.model_copy(
+                update={"favorite_products": validated_favorites}
+            )
+            projects[project_id]["context"] = updated_context.model_dump()
+            self._save_projects(projects)
+
+            # Count by category
+            favorites_by_category: Dict[str, int] = {}
+            for fav in validated_favorites:
+                cat = fav.get("category", "unknown")
+                favorites_by_category[cat] = favorites_by_category.get(cat, 0) + 1
+
+            self.logger.info(
+                "Favorite products saved successfully",
+                extra={
+                    "project_id": project_id,
+                    "count": len(validated_favorites),
+                    "by_category": favorites_by_category,
+                }
+            )
+
+            return {
+                "project_id": project_id,
+                "favorites_count": len(validated_favorites),
+                "favorites_by_category": favorites_by_category,
+                "status": "success",
+                "message": f"Saved {len(validated_favorites)} favorite products",
+            }
+
+        except Exception as e:
+            self.logger.error(
+                f"Failed to save favorite products: {str(e)}",
+                extra={"project_id": project_id},
+                exc_info=True,
+            )
+            raise
+
+    def set_selected_trending_products(
+        self,
+        project_id: str,
+        products: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """
+        Save user's selected trending products for image generation.
+        These products' images will be passed to Gemini for visual representation.
+
+        Args:
+            project_id: The project ID
+            products: List of product dicts with category, url, title, image_url, store
+
+        Returns:
+            Confirmation with counts
+        """
+        try:
+            self.logger.info(
+                "Saving selected trending products",
+                extra={"project_id": project_id, "count": len(products)}
+            )
+
+            projects = self._load_projects()
+            if project_id not in projects:
+                raise ValueError(f"Project {project_id} not found")
+
+            context = ProjectContext.model_validate(projects[project_id]["context"])
+
+            # Validate and store selected trending products
+            validated_products = []
+            for prod in products:
+                validated_products.append({
+                    "category": prod.get("category", ""),
+                    "url": prod.get("url", ""),
+                    "title": prod.get("title", ""),
+                    "image_url": prod.get("image_url", ""),
+                    "store": prod.get("store", ""),
+                    "price_str": prod.get("price_str"),
+                })
+
+            updated_context = context.model_copy(
+                update={"selected_trending_products": validated_products}
+            )
+            projects[project_id]["context"] = updated_context.model_dump()
+            self._save_projects(projects)
+
+            # Count by category
+            products_by_category: Dict[str, int] = {}
+            for prod in validated_products:
+                cat = prod.get("category", "unknown")
+                products_by_category[cat] = products_by_category.get(cat, 0) + 1
+
+            self.logger.info(
+                "Selected trending products saved successfully",
+                extra={
+                    "project_id": project_id,
+                    "count": len(validated_products),
+                    "by_category": products_by_category,
+                }
+            )
+
+            return {
+                "project_id": project_id,
+                "products_count": len(validated_products),
+                "products_by_category": products_by_category,
+                "status": "success",
+                "message": f"Saved {len(validated_products)} trending products for image generation",
+            }
+
+        except Exception as e:
+            self.logger.error(
+                f"Failed to save selected trending products: {str(e)}",
+                extra={"project_id": project_id},
+                exc_info=True,
+            )
             raise
 
     def _analyze_single_item(self, project_id: str, rect: ClipRect, use_inspiration_image: bool = False) -> dict:
@@ -1650,6 +2897,7 @@ Return exactly 6 recommendations that are distinct and complementary to each oth
                     timeout=1.5,
                     max_workers=8,
                     max_fetch=10,
+                    search_query=search_query,  # Enable multi-signal ranking
                 )
                 products = scored.get("products", products)
                 scoring_meta = scored.get("meta", {})
@@ -1925,6 +3173,7 @@ Return exactly 6 recommendations that are distinct and complementary to each oth
                     timeout=1.5,
                     max_workers=8,
                     max_fetch=10,
+                    search_query=search_query,  # Enable multi-signal ranking
                 )
                 products = scored.get("products", products)
                 scoring_meta = scored.get("meta", {})
@@ -2408,10 +3657,35 @@ Return exactly 6 recommendations that are distinct and complementary to each oth
             prompt = f"""### ROLE & OBJECTIVE
 You are a master of Architectural Photography and Interior Restoration. Your task is to modify the provided photograph (the input image) by replacing specific furniture and decor while maintaining the exact architectural shell and original camera properties. The goal is a "Real-Life" photograph, not a digital render.
 
-### 1. STRUCTURAL LOCKDOWN (NON-NEGOTIABLE)
-DO NOT ALTER: The position of walls, ceiling height, window frames, door locations, flooring material, or electrical outlets.
-SPATIAL DYNAMICS: New furniture must occupy the same 3D coordinate space as the items they replace. Ensure the scale of new items matches the realistic dimensions of the room's footprint.
-PERSPECTIVE: Maintain the exact lens focal length and camera angle of the original photo.
+### 1. STRUCTURAL LOCKDOWN (ABSOLUTE REQUIREMENT)
+You are EDITING the original room photograph - NOT creating a new room.
+
+COMPARE EVERY GENERATED FRAME TO THE ORIGINAL:
+- The room dimensions must be IDENTICAL to the input image
+- Furniture scale must match the original room's proportions
+- If the original shows a 12x14ft room, the generated image must show the SAME sized space
+
+DO NOT ALTER UNDER ANY CIRCUMSTANCES:
+- Wall positions, angles, colors, and textures
+- Ceiling height and features
+- Window frames, sizes, and positions
+- Door locations, sizes, and frames
+- Flooring material, pattern, and boundaries
+- Electrical outlets and switches
+
+ROOM ORIENTATION RULES:
+- The camera viewpoint must be EXACTLY the same as the original
+- Wall positions, angles, and distances must remain FIXED
+- If a wall is 10ft away in the original, it must appear 10ft away in the output
+- The vanishing points and perspective lines must align precisely with the original
+
+SPATIAL PROPORTION CHECK:
+- Before finalizing: Does a person of average height fit the same way in both images?
+- Do doorways appear the same relative size?
+- Are window proportions maintained?
+- Is the floor area the same?
+
+PERSPECTIVE: Maintain the exact lens focal length, camera angle, horizon line, and field of view of the original photo.
 
 ### 2. PHOTOGRAPHIC REALISM PROTOCOLS (CRITICAL)
 LIGHTING PHYSICS: Do not add "magical" light sources. All illumination must come from the existing windows and any visible lamps in the original photo. Shadows must be hard-edged or soft based on the original photo's light direction.
@@ -2439,10 +3713,24 @@ Generate a high-resolution photograph. If the image looks like a "3D concept ren
 
             print(f"🎨 Inspiration redesign prompt: {prompt[:200]}...")
 
+            # Get selected trending products for image generation
+            selected_trending = context.selected_trending_products or []
+            product_images_for_gemini = None
+            if selected_trending:
+                product_images_for_gemini = [
+                    {"image_url": p.get("image_url", ""), "title": p.get("title", "")}
+                    for p in selected_trending
+                    if p.get("image_url")
+                ]
+                self.logger.info(
+                    f"Passing {len(product_images_for_gemini)} trending product images to Gemini"
+                )
+
             # Call Gemini API using the new method
             generated_image_base64 = self.gemini_client.generate_room_redesign(
                 original_room_image_path=original_room_image_path,
-                prompt=prompt
+                prompt=prompt,
+                product_images=product_images_for_gemini
             )
 
             # Assign to generated_image_base64 for the rest of the function to use
@@ -2526,7 +3814,10 @@ Generate a high-resolution photograph. If the image looks like a "3D concept ren
             image_bytes = base64.b64decode(image_base64)
             full_image = Image.open(BytesIO(image_bytes)).convert("RGB")
             width, height = full_image.size
-            
+
+            # Compute image hash for caching (used to detect if image changed)
+            image_hash = hashlib.md5(image_bytes).hexdigest()[:16]
+
             # Initialize Utilities
             from spatial_utils import SpatialDetector, smart_crop
             spatial_detector = SpatialDetector()
@@ -2555,18 +3846,32 @@ Generate a high-resolution photograph. If the image looks like a "3D concept ren
                     if x is None or y is None:
                         self.logger.warning(f"Skipping selection without coordinates: {selection}")
                         continue
-                        
+
                     self.logger.info(f"Analyzing selection at {x}, {y}")
-                    
+
+                    # ============================================================
+                    # CACHE CHECK: Skip expensive analysis if result is cached
+                    # Cache key based on (project, image hash, click location)
+                    # ============================================================
+                    bbox_cache_key = f"{round(x, 2):.2f}_{round(y, 2):.2f}"
+                    cached_analysis = cache_manager.get_furniture_analysis(
+                        project_id, image_hash, bbox_cache_key
+                    )
+                    if cached_analysis:
+                        print(f"   💾 Cache HIT for furniture at ({x:.2f}, {y:.2f})")
+                        analysis_results.append(cached_analysis)
+                        continue  # Skip to next selection
+
                     # ============================================================
                     # STEP 1: Gemini Spatial Detection (Object + Bounding Box)
                     # ============================================================
                     detection = spatial_detector.get_object_bbox(
-                        image_bytes, 
-                        click_x=x, 
+                        image_bytes,
+                        click_x=x,
                         click_y=y,
                         image_width=width,
-                        image_height=height
+                        image_height=height,
+                        space_type=context.space_type  # Pass space_type for smarter fallback
                     )
                     
                     label = detection["label"]
@@ -2583,12 +3888,44 @@ Generate a high-resolution photograph. If the image looks like a "3D concept ren
                     # STEP 2: Smart Crop using Gemini Bounding Box
                     # ============================================================
                     crop = smart_crop(full_image, bbox_norm, padding=0.05)
-                    
-                    # Store crop as base64 for returning to UI if needed
+
+                    # Prepare crop for optimal reverse image search quality
+                    crop = self._prepare_crop_for_search(crop, target_size=512)
+
+                    # Store crop as high-quality JPEG base64 for ImgBB/Google Lens
                     crop_buffer = BytesIO()
-                    crop.save(crop_buffer, format='PNG')
+                    crop.save(crop_buffer, format='JPEG', quality=95)  # Higher quality for better matching
                     crop_base64 = base64.b64encode(crop_buffer.getvalue()).decode('utf-8')
-                    
+
+                    # ============================================================
+                    # STEP 2b: CLIP Fallback when Gemini Detection Failed
+                    # ============================================================
+                    if detection.get("fallback") and self.clip_client and self.clip_client.is_available():
+                        print(f"   🔍 Gemini fallback triggered - using CLIP to classify crop...")
+                        try:
+                            clip_analysis = self.clip_client.analyze_furniture_region(crop)
+                            if clip_analysis and "error" not in clip_analysis:
+                                furniture_type = clip_analysis.get("furniture_type", {})
+                                clip_confidence = furniture_type.get("confidence", 0)
+                                if clip_confidence > 0.50:
+                                    label = furniture_type.get("name", label)
+                                    # Also update attributes from CLIP
+                                    attributes = {
+                                        "color": clip_analysis.get("color", {}).get("name", "unknown"),
+                                        "material": clip_analysis.get("material", {}).get("name", "unknown"),
+                                        "style": clip_analysis.get("style", {}).get("name", "unknown"),
+                                    }
+                                    # Generate better search query
+                                    search_query = self.clip_client.generate_enhanced_search_query(crop) or label
+                                    print(f"   ✅ CLIP detected: '{label}' (conf: {clip_confidence:.2f})")
+                                    print(f"   🎨 Attributes: {attributes}")
+                                else:
+                                    print(f"   ⚠️ CLIP confidence too low ({clip_confidence:.2f}), keeping '{label}'")
+                            else:
+                                print(f"   ⚠️ CLIP analysis failed: {clip_analysis.get('error', 'unknown error')}")
+                        except Exception as e:
+                            print(f"   ❌ CLIP fallback error: {e}")
+
                     # ============================================================
                     # STEP 3: Parallel Search (Google Lens + Exa)
                     # ============================================================
@@ -2597,41 +3934,52 @@ Generate a high-resolution photograph. If the image looks like a "3D concept ren
                     # --- 3A: Google Lens Reverse Image Search ---
                     if self.serp_client:
                         # Upload crop to ImgBB for public URL
+                        print(f"   🔍 Uploading to ImgBB for Google Lens search...")
                         public_url = self.upload_image_to_imgbb(crop_base64)
-                        
+
                         if public_url:
+                            print(f"   ✅ ImgBB upload successful: {public_url[:50]}...")
                             self.logger.info(f"Searching Google Lens with public URL: {public_url}")
                             lens_results = self.serp_client.reverse_image_search_google_lens_url(public_url)
-                            for lens_match in lens_results[:12]:
+                            # Use rank-based scoring instead of hardcoded 1.0
+                            for i, lens_match in enumerate(lens_results[:12]):
                                 # Map to internal product format
                                 all_products.append({
                                     "title": lens_match.get("title", "Unknown Product"),
                                     "url": lens_match.get("product_link") or lens_match.get("link", ""),
                                     "store": lens_match.get("source", "Unknown"),
                                     "thumbnail": lens_match.get("thumbnail", ""),
+                                    "image_url": lens_match.get("thumbnail", ""),  # Normalize image field
                                     "price": None,
                                     "price_str": str(lens_match.get("price") or ""),
                                     "description": lens_match.get("title", ""),
                                     "source_api": "google_lens",
-                                    "relevance_score": 1.0,
+                                    "relevance_score": 1.0 - (i * 0.05),  # Rank-based: 1.0, 0.95, 0.90...
+                                    "search_method": "Google Lens",
                                     "images": [lens_match.get("thumbnail")] if lens_match.get("thumbnail") else []
                                 })
                         else:
+                            print(f"   ⚠️ ImgBB upload failed, skipping Google Lens")
                             self.logger.warning("ImgBB upload failed, skipping Google Lens URL search")
-                    
-                    # --- 3B: Exa Neural Search ---
-                    # Use dedicated search_utils for Exa (as per plan)
+
+                    # --- 3B: Exa Neural Search with Multi-Query Strategy ---
+                    # Generate multiple search queries for better coverage
                     try:
                         from search_utils import search_exa_products
-                        # Construct rich query from Gemini attributes
-                        color = attributes.get("color", "")
-                        material = attributes.get("material", "")
-                        style = attributes.get("style", "")
-                        exa_query = f"{color} {material} {style} {label}".strip()
-                        self.logger.info(f"Searching Exa with query: {exa_query}")
-                        
-                        exa_results = search_exa_products(exa_query, num_results=8)
-                        all_products.extend(exa_results)
+
+                        # Generate multiple queries for distinctive items
+                        search_queries = self._generate_multi_queries(label, attributes)
+                        print(f"   🔎 Multi-query search: {search_queries}")
+
+                        for query in search_queries:
+                            self.logger.info(f"Searching Exa with query: {query}")
+                            try:
+                                # Fewer results per query since we're doing multiple
+                                results_per_query = max(4, 12 // len(search_queries))
+                                exa_results = search_exa_products(query, num_results=results_per_query)
+                                all_products.extend(exa_results)
+                            except Exception as query_err:
+                                self.logger.warning(f"Exa query '{query}' failed: {query_err}")
                     except Exception as e:
                         self.logger.warning(f"Exa search failed: {e}")
 
@@ -2642,24 +3990,73 @@ Generate a high-resolution photograph. If the image looks like a "3D concept ren
                     # STEP 4: CLIP Validation and Reranking
                     # ============================================================
                     if self.clip_client and self.clip_client.is_available() and all_products:
+                        # Step 4A: Text-to-image validation (filter by label relevance)
                         self.logger.info(f"Validating {len(all_products)} products with CLIP against label: '{label}'")
                         validated_products = self.clip_client.validate_products_by_label(
                             label=label,
                             products=all_products,
-                            threshold=0.15, # Slightly lower threshold to be safe
-                            top_k=8
+                            threshold=0.40,  # Higher threshold to reduce false positives
+                            top_k=16  # Keep more for visual reranking
                         )
                         # Only replace if validation didn't empty results aggressively
                         if validated_products:
-                           all_products = validated_products
-                    
+                            all_products = validated_products
+
+                        # Step 4B: Image-to-image visual similarity reranking
+                        # This finds products that look most like the actual furniture crop
+                        self.logger.info(f"Reranking {len(all_products)} products by visual similarity")
+                        all_products = self.clip_client.rerank_products_by_visual_similarity(
+                            query_image=crop,
+                            products=all_products,
+                            top_k=12,
+                            min_similarity=0.25  # Lower threshold, let visual ranking sort
+                        )
+                        print(f"   📊 Visual similarity reranking complete")
+
+                    # Validate product links work
+                    all_products = self._validate_product_links(all_products, max_validate=8)
+
                     # Limit final results
                     all_products = all_products[:12]
-                    
+
+                    # ============================================================
+                    # STEP 5: Bed Component Expansion
+                    # If detected furniture is a bed, search for additional components
+                    # Uses two-stage filtering to avoid false positives (e.g., "bedside lamp")
+                    # ============================================================
+                    bed_components = None
+                    is_bed = self._is_actual_bed(label)
+
+                    if is_bed:
+                        print(f"   🛏️ Detected bed (label: '{label}') - expanding to search for components")
+                        self.logger.info(f"Bed detected: label='{label}', searching for bed components")
+                        
+                        # Step 1: Use Gemini Vision to detect visible sub-components
+                        detected_components = {}
+                        try:
+                            detected_components = self._detect_bed_sub_components(crop)
+                        except Exception as detect_err:
+                            self.logger.warning(f"Bed component detection failed: {detect_err}")
+                        
+                        # Step 2: Search for products using component-specific attributes
+                        bed_components = self._search_bed_components(
+                            attributes=attributes,
+                            style=attributes.get("style", ""),
+                            color=attributes.get("color", ""),
+                            material=attributes.get("material", ""),
+                            detected_components=detected_components  # Pass detected components
+                        )
+                        # Log bed component results
+                        if bed_components:
+                            for comp_key, comp_products in bed_components.items():
+                                print(f"   📦 {comp_key}: {len(comp_products)} products")
+                    else:
+                        print(f"   ℹ️ Not a bed (label: '{label}') - skipping bed components")
+
                     # Create FurnitureAnalysisItem result
                     from models import FurnitureAnalysisItem
-                    
-                    # Map to FurnitureAnalysisItem structure (must match model exactly)
+
+                    # Map to FurnitureAnalysisItem structure with bed components
                     analysis_item = FurnitureAnalysisItem(
                         id=f"item_{int(time.time())}_{x}",
                         furniture_type=label,
@@ -2668,11 +4065,19 @@ Generate a high-resolution photograph. If the image looks like a "3D concept ren
                         material=attributes.get("material", ""),
                         color=attributes.get("color", ""),
                         search_query=search_query,
-                        products=all_products
+                        products=all_products,
+                        is_bed=is_bed,
+                        bed_components=bed_components if is_bed else None
                     )
-                    
-                    analysis_results.append(analysis_item.model_dump())
-                    
+
+                    # Cache the analysis result before appending
+                    analysis_dict = analysis_item.model_dump()
+                    cache_manager.set_furniture_analysis(
+                        project_id, image_hash, bbox_cache_key, analysis_dict
+                    )
+
+                    analysis_results.append(analysis_dict)
+
                 except Exception as e:
                     self.logger.error(f"Error analyzing selection {selection}: {e}", exc_info=True)
                     # Continue to next selection even if one fails
@@ -2691,20 +4096,353 @@ Generate a high-resolution photograph. If the image looks like a "3D concept ren
             log_external_api_call("batch", "analyze_furniture", 0, False)
             raise
 
+    def _is_actual_bed(self, label: str) -> bool:
+        """
+        Determine if a furniture label refers to a bed or bed region (including bedding items).
 
+        This function has been expanded to recognize that clicking on bedding items
+        (duvet, comforter, pillows, sheets) on a bed should trigger the full bed
+        component search.
 
+        Uses a multi-stage approach:
+        1. First check compound exclusions (bedside lamp, nightstand, etc.)
+        2. Then check for bed indicators
+        3. Also check for bedding items that are part of a bed
+
+        Args:
+            label: The detected furniture label from Gemini/CLIP
+
+        Returns:
+            True if this is a bed or bed region (should trigger component search), False otherwise
+        """
+        from config import (
+            BED_PRIMARY_INDICATORS,
+            NOT_BED_COMPOUND_TERMS,
+        )
+
+        label_lower = label.lower().strip()
+
+        # Step 1: Check compound exclusions first (most specific, fastest rejection)
+        # These are items that are clearly NOT part of a bed even if "bed" appears
+        for not_bed_term in NOT_BED_COMPOUND_TERMS:
+            if not_bed_term in label_lower:
+                self.logger.debug(f"Bed check: '{label}' excluded by compound term '{not_bed_term}'")
+                return False
+
+        # Step 2: Explicit NON-bed furniture types (these should never trigger bed search)
+        non_bed_furniture = [
+            "lamp", "light", "chandelier", "sconce", "fixture",
+            "table", "desk", "console", "chair", "sofa", "couch",
+            "dresser", "cabinet", "shelf", "bookcase", "wardrobe",
+            "rug", "carpet", "curtain", "mirror", "clock", "art",
+            "nightstand", "side table", "end table",
+        ]
+        for exclusion in non_bed_furniture:
+            if exclusion in label_lower:
+                self.logger.debug(f"Bed check: '{label}' excluded by furniture term '{exclusion}'")
+                return False
+
+        # Step 3: Check primary bed indicators (bed, bed frame, etc.)
+        for bed_term in BED_PRIMARY_INDICATORS:
+            if bed_term in label_lower:
+                self.logger.debug(f"Bed check: '{label}' matched primary indicator '{bed_term}'")
+                return True
+
+        # Step 4: Check simple "bed" term
+        if "bed" in label_lower:
+            self.logger.debug(f"Bed check: '{label}' matched simple bed term")
+            return True
+
+        # Step 5: NEW - Check for bedding items that are ON a bed
+        # When someone clicks on a duvet/comforter/pillows on a bed, we should
+        # search for all bed components
+        bedding_indicators = [
+            "duvet", "duvet cover", "comforter", "quilt", "bedspread",
+            "bedding", "bed sheet", "sheet set", "fitted sheet",
+            "pillow", "cushion", "throw blanket", "throw",
+            "coverlet", "bed cover", "bed linen",
+        ]
+        for bedding_term in bedding_indicators:
+            if bedding_term in label_lower:
+                self.logger.info(f"Bed check: '{label}' is bedding item '{bedding_term}' - treating as bed region")
+                print(f"   🛏️ Detected bedding item '{label}' - will search for ALL bed components")
+                return True
+
+        return False
+
+    def _detect_bed_sub_components(
+        self,
+        bed_crop: Image.Image,
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        Use Gemini Vision to detect visible sub-components within a bed image.
+        
+        Analyzes the bed crop to identify:
+        - Visible pillows (decorative, sleeping) with colors/patterns
+        - Bedding/duvet/comforter with colors/patterns
+        - Throw blanket if visible with colors/materials
+        - Bed frame/headboard with material/style
+        
+        Args:
+            bed_crop: PIL Image of the cropped bed region
+            
+        Returns:
+            Dict of detected components with their attributes, e.g.:
+            {
+                "pillows": {"visible": True, "color": "cream", "style": "textured", "count": 4},
+                "bedding": {"visible": True, "color": "white", "pattern": "solid", "material": "linen"},
+                "throw": {"visible": True, "color": "beige", "material": "knit"},
+                "bed_frame": {"visible": True, "material": "wood", "color": "walnut", "style": "modern"}
+            }
+        """
+        from pydantic import BaseModel, Field
+        from typing import Optional as OptionalType
+        import base64
+        from io import BytesIO
+        
+        try:
+            # Convert crop to base64
+            buffer = BytesIO()
+            bed_crop.convert("RGB").save(buffer, format="JPEG", quality=85)
+            crop_b64 = base64.b64encode(buffer.getvalue()).decode()
+            
+            class BedComponent(BaseModel):
+                visible: bool = Field(description="Whether this component is visible in the image")
+                color: OptionalType[str] = Field(default=None, description="Primary color of the component")
+                secondary_color: OptionalType[str] = Field(default=None, description="Secondary/accent color if present")
+                pattern: OptionalType[str] = Field(default=None, description="Pattern: solid, striped, textured, floral, geometric, etc.")
+                material: OptionalType[str] = Field(default=None, description="Material: linen, cotton, velvet, knit, wood, upholstered, etc.")
+                style: OptionalType[str] = Field(default=None, description="Style: modern, traditional, bohemian, minimalist, etc.")
+                count: OptionalType[int] = Field(default=None, description="Count if applicable (e.g., number of pillows)")
+            
+            class BedComponentsResponse(BaseModel):
+                pillows: BedComponent = Field(description="Decorative or sleeping pillows on the bed")
+                bedding: BedComponent = Field(description="Main bedding - duvet, comforter, or bedspread")
+                throw: BedComponent = Field(description="Throw blanket or decorative blanket if present")
+                bed_frame: BedComponent = Field(description="Bed frame or headboard")
+            
+            prompt = """Analyze this bed image and identify the visible components.
+
+For each component, describe:
+1. pillows: All visible pillows (decorative and sleeping). Note color, pattern, count.
+2. bedding: The main bedding (duvet/comforter/bedspread). Note color, pattern, material.
+3. throw: Any throw blanket visible at foot of bed or draped. Note color and material.
+4. bed_frame: The bed frame/headboard. Note material (wood/upholstered/metal), color, style.
+
+Be specific about colors (e.g., "cream", "sage green", "charcoal gray" not just "white" or "green").
+Be specific about materials (e.g., "linen", "velvet", "knit wool" not just "fabric").
+If a component is not visible or unclear, set visible=false.
+"""
+            
+            # Call Gemini with the bed crop
+            result = self.gemini_client.analyze_images_with_vision(
+                prompt=prompt,
+                pydantic_model=BedComponentsResponse,
+                image_parts=[{
+                    "inline_data": {
+                        "mime_type": "image/jpeg",
+                        "data": crop_b64
+                    }
+                }],
+                system_message="You are an interior design expert analyzing bedroom styling. Be specific about colors, patterns, and materials to help find matching products."
+            )
+            
+            # Convert to dict
+            components = result.model_dump()
+            
+            # Log what was detected
+            visible_components = [k for k, v in components.items() if v.get("visible")]
+            print(f"   🔍 Detected bed components: {', '.join(visible_components)}")
+            for comp_name, comp_data in components.items():
+                if comp_data.get("visible"):
+                    attrs = [f"{k}={v}" for k, v in comp_data.items() if v and k != "visible"]
+                    print(f"      - {comp_name}: {', '.join(attrs[:4])}")
+            
+            return components
+            
+        except Exception as e:
+            self.logger.warning(f"Bed sub-component detection failed: {e}")
+            print(f"   ⚠️ Bed component detection failed: {e}, using default search")
+            # Return empty dict to fall back to default behavior
+            return {}
+
+    def _search_bed_components(
+        self,
+        attributes: Dict[str, Any],
+        style: str = "",
+        color: str = "",
+        material: str = "",
+        detected_components: Dict[str, Dict[str, Any]] = None
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Search for bed component products (frame, bedding, throw, pillows).
+        Returns 4 products for each component category.
+
+        Args:
+            attributes: Detected attributes from Gemini
+            style: Detected style (e.g., "modern", "traditional")
+            color: Detected color (e.g., "white", "gray")
+            material: Detected material (e.g., "wood", "upholstered")
+            detected_components: Component-specific attributes from Gemini Vision
+
+        Returns:
+            Dict with keys: bed_frame, bedding, throw, pillows
+            Each value is a list of up to 4 products
+        """
+        from config import BED_COMPONENTS
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        components_results = {}
+        detected_components = detected_components or {}
+
+        def search_component(component_key: str, component_config: Dict) -> tuple:
+            """Search for a single bed component."""
+            try:
+                search_terms = component_config.get("search_terms", [component_key])
+                # Build search query with style/color context
+                base_query = search_terms[0] if search_terms else component_key
+
+                # Use component-specific attributes if detected, otherwise fall back to bed's overall attributes
+                comp_attrs = detected_components.get(component_key, {})
+
+                # Don't use bed frame attributes for textile components
+                textile_components = {"bedding", "throw", "pillows"}
+                if component_key in textile_components:
+                    # Textiles should use their own detected attributes, not bed frame's
+                    comp_color = comp_attrs.get("color", "white")  # Default to neutral
+                    comp_material = comp_attrs.get("material", "cotton")  # Default to common textile
+                else:
+                    comp_color = comp_attrs.get("color") or color
+                    comp_material = comp_attrs.get("material") or material
+                comp_style = comp_attrs.get("style") or style
+                comp_pattern = comp_attrs.get("pattern", "")
+                
+                # Build query with detected attributes
+                query_parts = []
+                if comp_color:
+                    query_parts.append(comp_color)
+                if comp_pattern and comp_pattern != "solid":
+                    query_parts.append(comp_pattern)
+                if comp_material:
+                    query_parts.append(comp_material)
+                if comp_style:
+                    query_parts.append(comp_style)
+                query_parts.append(base_query)
+
+                search_query = " ".join(query_parts)
+                self.logger.info(f"Searching bed component '{component_key}': {search_query}")
+
+                products = []
+                serp_count = 0
+                exa_count = 0
+
+                # Search via SERP
+                if self.serp_client:
+                    try:
+                        serp_results = self.serp_client.search_and_analyze_products(
+                            query=search_query,
+                            space_type="bedroom",
+                            num_results=10
+                        )
+                        serp_count = len(serp_results)
+                        for p in serp_results:
+                            p["source_api"] = "serp"
+                        products.extend(serp_results)
+                        self.logger.info(f"  {component_key} SERP: {serp_count} products")
+                    except Exception as e:
+                        self.logger.warning(f"SERP search failed for {component_key}: {e}")
+                else:
+                    self.logger.warning(f"  {component_key}: SERP client not available")
+
+                # Search via Exa
+                if self.exa_client:
+                    try:
+                        exa_results = self.exa_client.search_and_analyze_products(
+                            query=search_query,
+                            space_type="bedroom",
+                            num_results=8,
+                            similar_per_seed=2
+                        )
+                        exa_count = len(exa_results)
+                        for p in exa_results:
+                            p["source_api"] = "exa"
+                        products.extend(exa_results)
+                        self.logger.info(f"  {component_key} Exa: {exa_count} products")
+                    except Exception as e:
+                        self.logger.warning(f"Exa search failed for {component_key}: {e}")
+                else:
+                    self.logger.info(f"  {component_key}: Exa client not available")
+
+                self.logger.info(f"  {component_key} total raw: {len(products)} (SERP: {serp_count}, Exa: {exa_count})")
+
+                # Deduplicate
+                before_dedup = len(products)
+                products = self._dedupe_products_by_url(products)
+                self.logger.info(f"  {component_key} after dedup: {len(products)} (removed {before_dedup - len(products)})")
+
+                # Format products with improved image extraction
+                formatted = []
+                for p in products:
+                    # Try multiple image sources
+                    image_url = ""
+                    images = p.get("images", [])
+                    if images and len(images) > 0:
+                        image_url = images[0]
+                    elif p.get("thumbnail"):
+                        image_url = p.get("thumbnail")
+                    elif p.get("image"):
+                        image_url = p.get("image")
+                    elif p.get("image_url"):
+                        image_url = p.get("image_url")
+
+                    formatted.append({
+                        "url": p.get("url", p.get("product_link", p.get("link", ""))),
+                        "title": p.get("title", ""),
+                        "image_url": image_url,
+                        "store": p.get("store", p.get("source", "Unknown")),
+                        "price_str": p.get("price_str", str(p.get("price", "")) if p.get("price") else ""),
+                        "price": p.get("price") if isinstance(p.get("price"), (int, float)) else None,
+                    })
+
+                # Filter to those with images and limit to 4
+                before_filter = len(formatted)
+                formatted = self._filter_products_with_images(formatted, min_count=4)[:4]
+                self.logger.info(f"  {component_key} final: {len(formatted)} products (filtered from {before_filter})")
+
+                return (component_key, formatted)
+
+            except Exception as e:
+                self.logger.error(f"Failed to search bed component {component_key}: {e}")
+                return (component_key, [])
+
+        # Search all components in parallel
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = {
+                executor.submit(search_component, key, config): key
+                for key, config in BED_COMPONENTS.items()
+            }
+
+            for future in as_completed(futures):
+                component_key, products = future.result()
+                components_results[component_key] = products
+
+        # Log results
+        total_products = sum(len(prods) for prods in components_results.values())
+        self.logger.info(f"Bed component search complete: {total_products} products across {len(components_results)} categories")
+
+        return components_results
 
     def upload_image_to_imgbb(self, image_base64: str) -> Optional[str]:
         """Upload a base64 image to ImgBB and return the public URL.
-        
+
         Args:
             image_base64: Base64-encoded image data (without data:image prefix)
-            
+
         Returns:
             Public URL of the uploaded image, or None if upload fails
         """
         import requests
-        
+
         imgbb_key = os.getenv("IMGBB_API_KEY")
         if not imgbb_key:
             self.logger.warning("IMGBB_API_KEY not found in environment")
@@ -3287,6 +5025,139 @@ Generate the most effective search query for this scenario:"""
             projects[project_id]["status"] = "MARKER_RECOMMENDATIONS_READY"
         self._save_projects(projects)
         return recs
+
+    # =========================================================================
+    # Process Furniture Selection (URL Resolution + Affiliate Cart)
+    # =========================================================================
+
+    def process_furniture_selection(
+        self,
+        project_id: str,
+        selected_products: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """
+        Process selected furniture products:
+        1. Resolve any Google Shopping URLs using Exa
+        2. Group by retailer using AffiliateClient
+        3. Generate affiliate links and cart URLs
+
+        Args:
+            project_id: The project ID
+            selected_products: List of products selected by the user
+
+        Returns:
+            Dict with resolved_products, retailer_carts, and stats
+        """
+        from urllib.parse import urlparse
+
+        if not selected_products:
+            return {
+                "resolved_products": [],
+                "retailer_carts": [],
+                "total_products": 0,
+                "resolved_count": 0,
+                "unresolved_count": 0
+            }
+
+        # Step 1: Extract URLs and resolve Google Shopping URLs
+        urls = [p.get("url", "") for p in selected_products if p.get("url")]
+        resolution_results = {}
+
+        if self.exa_client:
+            try:
+                resolution_results = self.exa_client.resolve_urls_batch(urls)
+            except Exception as e:
+                logging.error(f"URL resolution failed: {e}")
+                # Fall back to using original URLs
+                for url in urls:
+                    resolution_results[url] = {
+                        "is_google_shopping": False,
+                        "resolved_url": url,
+                        "resolution_success": True
+                    }
+
+        # Step 2: Build resolved products list
+        resolved_products = []
+        for product in selected_products:
+            original_url = product.get("url", "")
+            resolution = resolution_results.get(original_url, {})
+
+            resolved_url = resolution.get("resolved_url") or original_url
+            was_google_shopping = resolution.get("is_google_shopping", False)
+
+            resolved_products.append({
+                "original_url": original_url,
+                "resolved_url": resolved_url,
+                "title": product.get("title", ""),
+                "image_url": product.get("image_url", ""),
+                "store": product.get("store", ""),
+                "price_str": product.get("price_str", ""),
+                "was_google_shopping": was_google_shopping,
+                "affiliate_url": None,
+                "product_id": None,
+            })
+
+        # Step 3: Group by retailer and generate affiliate carts
+        affiliate_client = AffiliateClient()
+        resolved_urls = [p["resolved_url"] for p in resolved_products if p["resolved_url"]]
+
+        # Process URLs through affiliate client
+        grouped = affiliate_client.process_urls(resolved_urls)
+
+        # Step 4: Build retailer carts and update resolved products with affiliate info
+        retailer_carts = []
+        url_to_affiliate_info = {}
+
+        for retailer, products in grouped.items():
+            product_ids = []
+            cart_domain = None
+
+            for prod in products:
+                url_to_affiliate_info[prod["original_url"]] = {
+                    "affiliate_url": prod["affiliate_url"],
+                    "product_id": prod["product_id"],
+                }
+                if prod["product_id"] and prod["product_id"] != "unknown":
+                    product_ids.append(prod["product_id"])
+
+                # Preserve domain for regional Amazon
+                if retailer == "amazon" and not cart_domain:
+                    parsed = urlparse(prod["original_url"])
+                    if parsed.netloc and "amazon." in parsed.netloc:
+                        cart_domain = parsed.netloc
+
+            # Generate cart URL
+            cart_url = affiliate_client.generate_cart_url(
+                retailer, product_ids, domain=cart_domain
+            ) if product_ids else None
+
+            retailer_carts.append({
+                "retailer": retailer,
+                "retailer_display_name": affiliate_client.get_retailer_display_name(retailer),
+                "products": products,
+                "cart_url": cart_url,
+                "product_count": len(products)
+            })
+
+        # Update resolved products with affiliate info
+        for rp in resolved_products:
+            affiliate_info = url_to_affiliate_info.get(rp["resolved_url"], {})
+            rp["affiliate_url"] = affiliate_info.get("affiliate_url")
+            rp["product_id"] = affiliate_info.get("product_id")
+
+        # Calculate stats
+        resolved_count = sum(
+            1 for r in resolution_results.values()
+            if r.get("resolution_success")
+        )
+
+        return {
+            "resolved_products": resolved_products,
+            "retailer_carts": retailer_carts,
+            "total_products": len(selected_products),
+            "resolved_count": resolved_count,
+            "unresolved_count": len(urls) - resolved_count
+        }
 
 
 # Global instance
