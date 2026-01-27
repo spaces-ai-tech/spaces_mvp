@@ -1641,22 +1641,68 @@ async def replicate_segment(project_id: str, image_type: str = "product", image_
 async def generate_affiliate_cart(request: AffiliateCartRequest):
     """
     Generate affiliate cart from product URLs.
-    Groups products by retailer and creates cart URLs.
+    Resolves Google Shopping links, validates URLs, groups by retailer, creates cart URLs.
     """
-    logger.info(f"API request: generate affiliate cart for {len(request.product_urls)} URLs")
-    
+    original_urls = request.product_urls
+    logger.info(f"API request: generate affiliate cart for {len(original_urls)} URLs")
+
     try:
         from affiliate_client import AffiliateClient
-        
+        from exa_client import ExaClient
+
         affiliate_client = AffiliateClient()
-        
-        # Process URLs and group by retailer
-        grouped_products = affiliate_client.process_urls(request.product_urls)
-        
+
+        # ============================================================
+        # STEP 1: Resolve Google Shopping URLs to retailer pages
+        # ============================================================
+        resolved_urls = []
+        resolution_stats = {"google_shopping_count": 0, "resolved_count": 0}
+
+        try:
+            exa_client = ExaClient()
+            logger.info(f"Resolving {len(original_urls)} URLs (checking for Google Shopping links)...")
+
+            url_resolutions = exa_client.resolve_urls_batch(original_urls, resolve_google_shopping=True)
+
+            for url in original_urls:
+                resolution = url_resolutions.get(url, {})
+                resolved_url = resolution.get("resolved_url", url)
+                resolved_urls.append(resolved_url)
+
+                if resolution.get("is_google_shopping", False):
+                    resolution_stats["google_shopping_count"] += 1
+                    if resolution.get("resolution_success", False):
+                        resolution_stats["resolved_count"] += 1
+                        logger.info(f"✅ Resolved Google Shopping URL to: {resolved_url[:60]}...")
+
+            logger.info(f"Resolution complete: {resolution_stats['resolved_count']}/{resolution_stats['google_shopping_count']} Google Shopping URLs resolved")
+
+        except Exception as e:
+            logger.warning(f"URL resolution failed, using original URLs: {e}")
+            resolved_urls = original_urls
+
+        # ============================================================
+        # STEP 2: Validate URLs (check they return 200 status)
+        # ============================================================
+        logger.info(f"Validating {len(resolved_urls)} URLs...")
+        validation_results = affiliate_client.validate_urls(resolved_urls)
+
+        # Filter to valid URLs only
+        valid_urls = [url for url in resolved_urls if validation_results.get(url, {}).get("valid", False)]
+        invalid_count = len(resolved_urls) - len(valid_urls)
+
+        if invalid_count > 0:
+            logger.warning(f"{invalid_count} URLs failed validation")
+
+        # ============================================================
+        # STEP 3: Process valid URLs and group by retailer
+        # ============================================================
+        grouped_products = affiliate_client.process_urls(valid_urls)
+
         # Build response with retailer carts
         carts = []
         total_products = 0
-        
+
         for retailer, products in grouped_products.items():
             # Convert to AffiliateProduct models
             affiliate_products = [
@@ -1667,7 +1713,7 @@ async def generate_affiliate_cart(request: AffiliateCartRequest):
                 )
                 for p in products
             ]
-            
+
             # Generate cart URL for all products from this retailer
             product_ids = [p["product_id"] for p in products if p["product_id"] != "unknown"]
 
@@ -1675,7 +1721,6 @@ async def generate_affiliate_cart(request: AffiliateCartRequest):
             cart_domain = None
             if retailer == "amazon":
                 try:
-                    # Extract domain from the first product's original URL
                     from urllib.parse import urlparse
                     first_url = products[0]["original_url"]
                     parsed = urlparse(first_url)
@@ -1685,7 +1730,7 @@ async def generate_affiliate_cart(request: AffiliateCartRequest):
                     cart_domain = None
 
             cart_url = affiliate_client.generate_cart_url(retailer, product_ids, domain=cart_domain)
-            
+
             # Create retailer cart
             retailer_cart = RetailerCart(
                 retailer=retailer,
@@ -1694,20 +1739,24 @@ async def generate_affiliate_cart(request: AffiliateCartRequest):
                 cart_url=cart_url,
                 product_count=len(affiliate_products),
             )
-            
+
             carts.append(retailer_cart)
             total_products += len(affiliate_products)
-        
+
         logger.info(f"Generated {len(carts)} retailer carts with {total_products} total products")
-        
+
         return AffiliateCartResponse(
             carts=carts,
             total_products=total_products,
             total_retailers=len(carts),
             status="success",
             message=f"Generated {len(carts)} affiliate cart(s) with {total_products} product(s)",
+            urls_processed=len(original_urls),
+            urls_resolved=resolution_stats.get("resolved_count", 0),
+            urls_validated=len(valid_urls),
+            urls_failed=invalid_count,
         )
-        
+
     except Exception as e:
         logger.error(f"Failed to generate affiliate cart: {str(e)}")
         raise HTTPException(

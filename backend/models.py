@@ -1104,6 +1104,11 @@ class AffiliateCartResponse(BaseModel):
     total_retailers: int = Field(..., description="Number of different retailers")
     status: str = Field(default="success", description="Status of the operation")
     message: str = Field(default="Affiliate carts generated successfully")
+    # Validation metadata
+    urls_processed: int = Field(default=0, description="Total URLs received")
+    urls_resolved: int = Field(default=0, description="URLs successfully resolved from Google Shopping")
+    urls_validated: int = Field(default=0, description="URLs that passed validation (200 status)")
+    urls_failed: int = Field(default=0, description="URLs that failed validation")
 
 
 # ============================================================================

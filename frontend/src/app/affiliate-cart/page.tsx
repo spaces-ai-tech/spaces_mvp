@@ -24,19 +24,35 @@ interface AffiliateCartResponse {
   total_retailers: number;
   status: string;
   message: string;
+  // Validation metadata
+  urls_processed: number;
+  urls_resolved: number;
+  urls_validated: number;
+  urls_failed: number;
 }
 
 export default function AffiliateCartPage() {
   const [urlsText, setUrlsText] = useState("");
   const [carts, setCarts] = useState<RetailerCart[]>([]);
+  const [processingStep, setProcessingStep] = useState<string>("");
+  const [stats, setStats] = useState<{
+    urls_processed: number;
+    urls_resolved: number;
+    urls_validated: number;
+    urls_failed: number;
+  } | null>(null);
 
   const generateCartMutation = useMutation({
     mutationFn: async (urls: string[]) => {
+      setProcessingStep("Resolving Google Shopping links...");
+
       const response = await fetch("http://localhost:8000/api/affiliate/generate-cart", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ product_urls: urls }),
       });
+
+      setProcessingStep("Processing results...");
 
       if (!response.ok) {
         throw new Error("Failed to generate affiliate cart");
@@ -46,6 +62,16 @@ export default function AffiliateCartPage() {
     },
     onSuccess: (data) => {
       setCarts(data.carts);
+      setStats({
+        urls_processed: data.urls_processed,
+        urls_resolved: data.urls_resolved,
+        urls_validated: data.urls_validated,
+        urls_failed: data.urls_failed,
+      });
+      setProcessingStep("");
+    },
+    onError: () => {
+      setProcessingStep("");
     },
   });
 
@@ -61,12 +87,15 @@ export default function AffiliateCartPage() {
       return;
     }
 
+    setStats(null);
     generateCartMutation.mutate(urls);
   };
 
   const handleClear = () => {
     setUrlsText("");
     setCarts([]);
+    setStats(null);
+    setProcessingStep("");
   };
 
   return (
@@ -100,7 +129,7 @@ export default function AffiliateCartPage() {
               disabled={generateCartMutation.isPending || !urlsText.trim()}
               className="flex-1 bg-blue-600 text-white px-6 py-3 rounded-lg font-medium hover:bg-blue-700 disabled:bg-gray-300 disabled:cursor-not-allowed transition-colors"
             >
-              {generateCartMutation.isPending ? "Generating..." : "Generate Affiliate Carts"}
+              {generateCartMutation.isPending ? "Processing..." : "Generate Affiliate Carts"}
             </button>
             <button
               onClick={handleClear}
@@ -109,6 +138,14 @@ export default function AffiliateCartPage() {
               Clear
             </button>
           </div>
+
+          {/* Processing Status */}
+          {generateCartMutation.isPending && processingStep && (
+            <div className="mt-4 p-4 bg-blue-50 border border-blue-200 rounded-lg flex items-center gap-3">
+              <div className="animate-spin h-5 w-5 border-2 border-blue-600 border-t-transparent rounded-full"></div>
+              <p className="text-blue-800 text-sm font-medium">{processingStep}</p>
+            </div>
+          )}
 
           {generateCartMutation.isError && (
             <div className="mt-4 p-4 bg-red-50 border border-red-200 rounded-lg">
@@ -122,6 +159,31 @@ export default function AffiliateCartPage() {
         {/* Results Section */}
         {carts.length > 0 && (
           <div className="space-y-6">
+            {/* Stats Summary */}
+            <div className="bg-white rounded-xl shadow-lg p-6">
+              <h3 className="text-lg font-semibold text-gray-900 mb-4">Processing Summary</h3>
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                <div className="text-center p-4 bg-gray-50 rounded-lg">
+                  <p className="text-2xl font-bold text-gray-900">{stats?.urls_processed || 0}</p>
+                  <p className="text-sm text-gray-600">URLs Submitted</p>
+                </div>
+                <div className="text-center p-4 bg-blue-50 rounded-lg">
+                  <p className="text-2xl font-bold text-blue-600">{stats?.urls_resolved || 0}</p>
+                  <p className="text-sm text-gray-600">Google Links Resolved</p>
+                </div>
+                <div className="text-center p-4 bg-green-50 rounded-lg">
+                  <p className="text-2xl font-bold text-green-600">{stats?.urls_validated || 0}</p>
+                  <p className="text-sm text-gray-600">URLs Validated</p>
+                </div>
+                {(stats?.urls_failed || 0) > 0 && (
+                  <div className="text-center p-4 bg-red-50 rounded-lg">
+                    <p className="text-2xl font-bold text-red-600">{stats?.urls_failed || 0}</p>
+                    <p className="text-sm text-gray-600">URLs Failed</p>
+                  </div>
+                )}
+              </div>
+            </div>
+
             <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
               <p className="text-blue-900 font-medium">
                 ✅ Generated {carts.length} cart(s) with{" "}

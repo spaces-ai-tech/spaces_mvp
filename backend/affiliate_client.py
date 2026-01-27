@@ -324,6 +324,99 @@ class AffiliateClient:
                 "affiliate_url": affiliate_url,
                 "product_id": product_id or "unknown",
             })
-        
+
         return grouped_products
+
+    def validate_urls(self, urls: List[str], timeout: float = 3.0) -> Dict[str, Dict]:
+        """
+        Validate that URLs are accessible (return 200 status).
+
+        Args:
+            urls: List of URLs to validate
+            timeout: Request timeout in seconds
+
+        Returns:
+            Dict mapping URL to validation result:
+            {
+                "url": "https://...",
+                "valid": True/False,
+                "status_code": 200,
+                "final_url": "https://..." (after redirects),
+                "error": None or "error message"
+            }
+        """
+        import requests
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def check_url(url: str) -> Dict:
+            try:
+                # Use HEAD request for speed, follow redirects
+                resp = requests.head(
+                    url,
+                    timeout=timeout,
+                    allow_redirects=True,
+                    headers={"User-Agent": "Mozilla/5.0 (compatible; SpacesBot/1.0)"}
+                )
+                return {
+                    "url": url,
+                    "valid": resp.status_code == 200,
+                    "status_code": resp.status_code,
+                    "final_url": resp.url,
+                    "error": None
+                }
+            except requests.exceptions.Timeout:
+                return {
+                    "url": url,
+                    "valid": False,
+                    "status_code": None,
+                    "final_url": None,
+                    "error": "Request timeout"
+                }
+            except requests.exceptions.ConnectionError as e:
+                return {
+                    "url": url,
+                    "valid": False,
+                    "status_code": None,
+                    "final_url": None,
+                    "error": f"Connection error: {str(e)[:50]}"
+                }
+            except Exception as e:
+                return {
+                    "url": url,
+                    "valid": False,
+                    "status_code": None,
+                    "final_url": None,
+                    "error": str(e)[:100]
+                }
+
+        results = {}
+
+        if not urls:
+            return results
+
+        logger.info(f"🔍 Validating {len(urls)} URLs...")
+
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {executor.submit(check_url, url): url for url in urls}
+            try:
+                for future in as_completed(futures, timeout=30):
+                    result = future.result()
+                    results[result["url"]] = result
+            except Exception as e:
+                logger.warning(f"URL validation timeout: {e}")
+                # Add remaining URLs as failed
+                for url in urls:
+                    if url not in results:
+                        results[url] = {
+                            "url": url,
+                            "valid": False,
+                            "status_code": None,
+                            "final_url": None,
+                            "error": "Validation timeout"
+                        }
+
+        valid_count = sum(1 for r in results.values() if r.get("valid"))
+        logger.info(f"✅ URL validation complete: {valid_count}/{len(urls)} valid")
+
+        return results
 
