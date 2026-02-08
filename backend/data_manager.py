@@ -3,6 +3,7 @@ import hashlib
 import json
 import logging
 import os
+import random
 import shutil
 import time
 import uuid
@@ -279,6 +280,119 @@ class DataManager:
             deduped.append(p)
         return deduped
 
+    def _validate_product_pages_with_exa(
+        self,
+        products: List[Dict[str, Any]],
+        max_validate: int = 15,
+        min_valid_threshold: int = 3
+    ) -> List[Dict[str, Any]]:
+        """
+        Validate that product URLs are actual product pages using Exa.
+
+        Uses Exa's get_contents() to fetch pages and check for shopping signals.
+        Filters out non-product pages (blogs, category pages, search results).
+
+        IMPORTANT: Never falls back to unfiltered results. Returns fewer results
+        rather than non-retailer URLs.
+
+        Args:
+            products: List of product dicts with 'url' field
+            max_validate: Maximum URLs to validate (rest pass through)
+            min_valid_threshold: Minimum valid products (informational only)
+
+        Returns:
+            Filtered list with only validated product pages from real retailers
+        """
+        from config import is_blocked_domain
+
+        if not products:
+            return products
+
+        # Pre-filter: Remove blocked non-retailer domains BEFORE Exa validation
+        pre_filtered = []
+        blocked_count = 0
+        for p in products:
+            url = p.get("url", "")
+            if is_blocked_domain(url):
+                blocked_count += 1
+                self.logger.debug(f"Pre-filtered blocked domain: {url[:60]}...")
+            else:
+                pre_filtered.append(p)
+
+        if blocked_count > 0:
+            self.logger.info(f"Pre-filtered {blocked_count} blocked non-retailer domains")
+
+        products = pre_filtered
+
+        if not self.exa_client:
+            self.logger.warning("Exa client not available, returning domain-filtered results only")
+            return products
+
+        if not products:
+            return products
+
+        to_validate = products[:max_validate]
+        remainder = products[max_validate:]
+
+        # Extract URLs for batch validation
+        urls_to_check = [p.get("url", "") for p in to_validate if p.get("url")]
+
+        if not urls_to_check:
+            return products
+
+        try:
+            # Use Exa's batch validation
+            validation_results = self.exa_client.validate_product_urls_batch(
+                urls=urls_to_check,
+                batch_size=5,
+                max_chars=2000
+            )
+
+            # Filter products based on validation results
+            validated = []
+            for product in to_validate:
+                url = product.get("url", "")
+                if url in validation_results:
+                    result = validation_results[url]
+                    if result.get("is_valid"):
+                        product["exa_validated"] = True
+                        product["has_shopping_signals"] = result.get("has_shopping_signals", False)
+                        validated.append(product)
+                    else:
+                        # Log why it failed
+                        self.logger.debug(
+                            f"URL failed Exa validation: {url[:60]}... "
+                            f"(is_product={result.get('is_product_page')}, "
+                            f"valid_retailer={result.get('is_valid_retailer')}, "
+                            f"shopping_signals={result.get('has_shopping_signals')})"
+                        )
+                else:
+                    # URL wasn't checked (shouldn't happen), include with warning
+                    product["exa_validated"] = False
+                    validated.append(product)
+
+            # CHANGED: Never fallback to unfiltered results
+            # Better to show fewer results than Instagram/blogs
+            if len(validated) < min_valid_threshold:
+                self.logger.warning(
+                    f"Only {len(validated)}/{len(to_validate)} URLs passed Exa validation "
+                    f"(below threshold of {min_valid_threshold}). "
+                    f"Returning {len(validated)} validated results (NOT falling back to unfiltered)."
+                )
+
+            self.logger.info(
+                f"Exa validation: {len(validated)}/{len(to_validate)} URLs passed as valid product pages"
+            )
+
+            # Add remainder (unvalidated but domain-filtered) at the end
+            return validated + remainder
+
+        except Exception as e:
+            self.logger.error(f"Exa validation failed entirely: {e}")
+            # Even on error, don't return products without domain filtering
+            # The products are already domain-filtered from pre-filtering above
+            return products
+
     def _prepare_crop_for_search(self, crop, target_size: int = 512):
         """Prepare crop for optimal reverse image search quality.
 
@@ -307,6 +421,23 @@ class DataManager:
         crop = enhancer.enhance(1.1)  # Subtle 10% contrast boost
 
         return crop
+
+    def _pil_to_base64(self, image: "Image.Image", format: str = "PNG") -> str:
+        """Convert PIL Image to base64 string.
+
+        Args:
+            image: PIL Image object
+            format: Image format (PNG, JPEG, etc.)
+
+        Returns:
+            Base64 encoded string of the image
+        """
+        from io import BytesIO
+        import base64
+
+        buffer = BytesIO()
+        image.save(buffer, format=format)
+        return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
     def upload_image_to_imgbb(self, image_base64: str) -> Optional[str]:
         """Upload base64 image to ImgBB and return public URL."""
@@ -702,6 +833,41 @@ class DataManager:
 
         self._save_projects(projects)
         return space_type
+
+    def set_improvement_mode(self, project_id: str, mode: str) -> str:
+        """Set the improvement mode for a project (iterative or complete_revamp)"""
+        projects = self._load_projects()
+
+        if project_id not in projects:
+            raise ValueError(f"Project {project_id} not found")
+
+        # Validate mode
+        if mode not in ("iterative", "complete_revamp"):
+            raise ValueError(f"Invalid mode: {mode}. Must be 'iterative' or 'complete_revamp'")
+
+        # Update project with improvement mode
+        current_context = ProjectContext.model_validate(projects[project_id]["context"])
+        updated_context = current_context.model_copy(update={"improvement_mode": mode})
+
+        projects[project_id]["context"] = updated_context.model_dump()
+        # Status stays the same - this is just a preference setting
+
+        self._save_projects(projects)
+
+        # Clear logging for debugging
+        print("\n" + "="*70)
+        print("🎛️ IMPROVEMENT MODE SET")
+        print("="*70)
+        print(f"📋 Project ID: {project_id}")
+        print(f"✅ Mode set to: '{mode}'")
+        if mode == "iterative":
+            print("   → Will use ITERATIVE prompt (surgical edits, no color/style changes)")
+        else:
+            print("   → Will use INTEGRATION prompt (full redesign with color/style)")
+        print("="*70 + "\n")
+
+        self.logger.info(f"Set improvement mode to '{mode}' for project {project_id}")
+        return mode
 
     def save_improvement_markers(
         self, project_id: str, markers: List[ImprovementMarker]
@@ -1819,9 +1985,9 @@ Return exactly 6 recommendations that are distinct and complementary to each oth
             needed = min_count - len(result)
             result.extend(with_any_images[:needed])
 
+        # Don't add products without images - they show as placeholders in the UI
         if len(result) < min_count:
-            needed = min_count - len(result)
-            result.extend(without_images[:needed])
+            print(f"[IMAGE_FILTER] ⚠️ Only {len(result)} products with images available (requested {min_count})")
 
         print(f"[IMAGE_FILTER] Output: {len(result)} products (min_count={min_count})")
         return result
@@ -2231,13 +2397,19 @@ Prefer: Clear photos, unique designs, trending aesthetics, professional product 
                     # Generate multiple query variations for better coverage
                     query_variations = [
                         f"trending {rec_lower}",
-                        f"best {rec_lower} 2024",
+                        f"best {rec_lower} 2025",
                         f"popular {rec_lower}",
                         f"{style_name} {rec_lower}" if style_name else f"modern {rec_lower}",
+                        f"buy {rec_lower} online",  # More product-focused
+                        f"{rec_lower} furniture",  # Retail-focused
                     ]
 
+                    # Shuffle query variations for variety in results
+                    random.shuffle(query_variations)
+                    print(f"[PRODUCT_SEARCH] 🔀 Shuffled query order for variety")
+
                     products: List[Dict[str, Any]] = []
-                    primary_query = query_variations[0]  # For logging
+                    primary_query = query_variations[0]  # For logging (now randomized)
 
                     # Search with each query variation
                     for query in query_variations:
@@ -2283,6 +2455,38 @@ Prefer: Clear photos, unique designs, trending aesthetics, professional product 
                                 print(f"[PRODUCT_SEARCH] Exa failed for '{query}': {e}")
                                 self.logger.warning(f"Exa search failed for query '{query}': {e}")
 
+                        # Google Images search - NEW (more visual results)
+                        images_count = 0
+                        if self.serp_client:
+                            try:
+                                # Use a product-focused query for images
+                                image_query = f"{rec_lower} furniture buy online"
+                                image_results = self.serp_client.search_images(
+                                    query=image_query,
+                                    num_results=10,
+                                )
+                                images_count = len(image_results)
+                                print(f"[PRODUCT_SEARCH] Google Images returned {images_count} for '{image_query}'")
+
+                                # Convert image results to product format
+                                for img in image_results:
+                                    # Use thumbnail or original image URL
+                                    image_url = img.get("thumbnail") or img.get("image_url") or ""
+
+                                    products.append({
+                                        "title": img.get("title", ""),
+                                        "url": img.get("url", ""),
+                                        "thumbnail": image_url,
+                                        "image_url": image_url,
+                                        "source": img.get("source", "Unknown"),
+                                        "store": img.get("source", "Unknown"),
+                                        "source_api": "google_images",
+                                        "search_query": image_query,
+                                    })
+                            except Exception as e:
+                                print(f"[PRODUCT_SEARCH] Google Images failed for '{rec_lower}': {e}")
+                                self.logger.warning(f"Google Images search failed: {e}")
+
                     # Log product collection stats
                     with_images = sum(1 for p in products if p.get("images") or p.get("thumbnail") or p.get("image_url") or p.get("image"))
                     print(f"[PRODUCT_SEARCH] === Summary for '{recommendation}' ===")
@@ -2300,17 +2504,15 @@ Prefer: Clear photos, unique designs, trending aesthetics, professional product 
                     # Convert to PreSearchedProduct format with better image extraction
                     formatted_products = []
                     for p in products:
-                        # Try multiple image sources
-                        image_url = ""
-                        images = p.get("images", [])
-                        if images and len(images) > 0:
-                            image_url = images[0]
-                        elif p.get("thumbnail"):
-                            image_url = p.get("thumbnail")
-                        elif p.get("image"):
-                            image_url = p.get("image")
-                        elif p.get("image_url"):
-                            image_url = p.get("image_url")
+                        # Try multiple image sources - prioritize thumbnail (SERP primary field)
+                        images_array = p.get("images") or []
+                        image_url = (
+                            p.get("thumbnail") or      # SERP primary image
+                            p.get("image_url") or      # Already normalized
+                            (images_array[0] if images_array else None) or  # Exa images array
+                            p.get("image") or          # Fallback field
+                            ""
+                        )
 
                         formatted_products.append({
                             "url": p.get("url", p.get("product_link", p.get("link", ""))),
@@ -2322,14 +2524,64 @@ Prefer: Clear photos, unique designs, trending aesthetics, professional product 
                             "similarity_score": p.get("similarity_score"),
                         })
 
-                    # Filter to products with valid images, ensure minimum 8 for AI curation
+                    # Filter to products with valid images
                     before_filter = len(formatted_products)
                     formatted_products = self._filter_products_with_images(
                         formatted_products,
-                        min_count=8  # Get more candidates for AI curation
+                        min_count=4  # Lowered from 8 to return more results
                     )
                     print(f"[PRODUCT_SEARCH] After image filter: {len(formatted_products)} (from {before_filter} formatted)")
                     self.logger.info(f"  - After image filter: {len(formatted_products)} (from {before_filter} formatted)")
+
+                    # RETRY LOGIC: If 0 results, try a simpler fallback query
+                    if len(formatted_products) == 0:
+                        print(f"[PRODUCT_SEARCH] 🔄 Retrying with simpler fallback query for '{recommendation}'")
+                        fallback_queries = [
+                            rec_lower,  # Just the item name
+                            f"{rec_lower} shop",
+                            f"{rec_lower} store",
+                        ]
+                        fallback_products = []
+                        for fallback_query in fallback_queries:
+                            if self.serp_client:
+                                try:
+                                    serp_fallback = self.serp_client.search_and_analyze_products(
+                                        query=fallback_query,
+                                        space_type=context.space_type or "general",
+                                        num_results=15,
+                                    )
+                                    print(f"[PRODUCT_SEARCH] Fallback SERP returned {len(serp_fallback)} for '{fallback_query}'")
+                                    fallback_products.extend(serp_fallback)
+                                except Exception as e:
+                                    print(f"[PRODUCT_SEARCH] Fallback SERP failed: {e}")
+
+                        if fallback_products:
+                            # Format and filter fallback products
+                            fallback_formatted = []
+                            for p in fallback_products:
+                                images_array = p.get("images") or []
+                                image_url = (
+                                    p.get("thumbnail") or
+                                    p.get("image_url") or
+                                    (images_array[0] if images_array else None) or
+                                    p.get("image") or
+                                    ""
+                                )
+                                fallback_formatted.append({
+                                    "url": p.get("url", p.get("product_link", p.get("link", ""))),
+                                    "title": p.get("title", ""),
+                                    "image_url": image_url,
+                                    "store": p.get("store", p.get("source", "Unknown")),
+                                    "price_str": p.get("price_str", str(p.get("price", "")) if p.get("price") else ""),
+                                    "price": p.get("price") if isinstance(p.get("price"), (int, float)) else None,
+                                    "similarity_score": p.get("similarity_score"),
+                                })
+                            formatted_products = self._filter_products_with_images(fallback_formatted, min_count=4)
+                            print(f"[PRODUCT_SEARCH] Fallback produced {len(formatted_products)} products with images")
+
+                    # Shuffle products before AI curation for variety each time
+                    random.shuffle(formatted_products)
+                    print(f"[PRODUCT_SEARCH] 🔀 Shuffled {len(formatted_products)} products before AI curation")
 
                     # AI Curation: Use Gemini to score and rank products by visual quality
                     try:
@@ -2344,17 +2596,30 @@ Prefer: Clear photos, unique designs, trending aesthetics, professional product 
                                 max_products=6  # Return up to 6 curated options
                             )
                             if curated_products and len(curated_products) >= 2:
-                                formatted_products = curated_products
-                                print(f"[AI_CURATION] ✅ AI curation returned {len(formatted_products)} products")
+                                # Add variety: if we have more than 6 products, randomly sample from top candidates
+                                if len(curated_products) > 6:
+                                    # Take top 10 (or all if fewer), then randomly pick 6
+                                    top_candidates = curated_products[:min(10, len(curated_products))]
+                                    formatted_products = random.sample(top_candidates, min(6, len(top_candidates)))
+                                    # Shuffle the final selection so order varies too
+                                    random.shuffle(formatted_products)
+                                    print(f"[AI_CURATION] ✅ Randomly selected {len(formatted_products)} from top {len(top_candidates)} curated products")
+                                else:
+                                    formatted_products = curated_products
+                                    random.shuffle(formatted_products)  # Still shuffle order
+                                    print(f"[AI_CURATION] ✅ AI curation returned {len(formatted_products)} products (shuffled)")
                             else:
                                 print(f"[AI_CURATION] ⚠️ AI curation returned insufficient products, using original list")
                                 formatted_products = formatted_products[:6]
+                                random.shuffle(formatted_products)
                         else:
                             formatted_products = formatted_products[:6]
+                            random.shuffle(formatted_products)
                     except Exception as ai_err:
                         print(f"[AI_CURATION] ❌ AI curation failed: {ai_err}, using original products")
                         self.logger.warning(f"AI curation failed: {ai_err}")
                         formatted_products = formatted_products[:6]
+                        random.shuffle(formatted_products)
 
                     # Ensure minimum 4 products
                     if len(formatted_products) < 4:
@@ -2808,6 +3073,11 @@ Prefer: Clear photos, unique designs, trending aesthetics, professional product 
 
             crop = image.crop((left, top, right, bottom))
 
+            # Calculate crop ratio for size-based furniture type deprioritization
+            # Small crops (<15% of image) are unlikely to be large furniture (beds, sofas)
+            crop_area = w * h  # Normalized coordinates (0-1 scale)
+            crop_ratio = crop_area  # Since full image area is 1.0 in normalized coords
+
             # Save crop temporarily to analyze with vision
             temp_dir = DATA_FILE.parent / "images" / project_id
             temp_dir.mkdir(parents=True, exist_ok=True)
@@ -2820,7 +3090,7 @@ Prefer: Clear photos, unique designs, trending aesthetics, professional product 
             target_type = None
             if self.clip_client and self.clip_client.is_available():
                 try:
-                    clip_analysis = self.clip_client.analyze_furniture_region(crop)
+                    clip_analysis = self.clip_client.analyze_furniture_region(crop, crop_ratio=crop_ratio)
                     target_type = (
                         clip_analysis.get("furniture_type", {}).get("name")
                         if clip_analysis and not clip_analysis.get("error")
@@ -2843,38 +3113,83 @@ Prefer: Clear photos, unique designs, trending aesthetics, professional product 
                     else (context.selected_product_recommendations[0] if context.selected_product_recommendations else "furniture")
                 )
 
-            # Execute SERP product search
+            # ============================================================
+            # VISUAL-FIRST PRODUCT SEARCH
+            # Primary: Google Lens (true visual search) -> direct retailer URLs
+            # Secondary: Text search (supplementary results)
+            # ============================================================
             products: List[Dict[str, Any]] = []
+            lens_products: List[Dict[str, Any]] = []
+            text_products: List[Dict[str, Any]] = []
 
-            # SERP
-            serp_products = self.serp_client.search_and_analyze_products(
-                query=search_query,
-                space_type=context.space_type or "general",
-                num_results=12,
-            )
-            for product in serp_products:
-                product["source_api"] = "serp"
-                product["search_method"] = "Google Shopping"
-            products.extend(serp_products)
+            # Upload crop to ImgBB for Google Lens (requires public URL)
+            crop_base64 = self._pil_to_base64(crop)
+            public_url = self.upload_image_to_imgbb(crop_base64)
 
-            # Exa (semantic) if available
-            if self.exa_client:
+            # ============================================================
+            # PRIMARY: Google Lens Reverse Image Search (8-10 results)
+            # Returns direct retailer URLs (not Google Shopping redirects)
+            # ============================================================
+            if public_url and self.serp_client:
                 try:
-                    exa_products = self.exa_client.search_and_analyze_products(
+                    self.logger.info(f"🔍 Running Google Lens search with public URL...")
+                    lens_results = self.serp_client.reverse_image_search_google_lens_url(public_url)
+                    for i, match in enumerate(lens_results[:10]):
+                        lens_products.append({
+                            "title": match.get("title", "Unknown Product"),
+                            "url": match.get("link") or match.get("product_link", ""),
+                            "store": match.get("source", "Unknown"),
+                            "source": match.get("source", "Unknown"),
+                            "thumbnail": match.get("thumbnail", ""),
+                            "image_url": match.get("thumbnail", ""),
+                            "images": [match.get("thumbnail")] if match.get("thumbnail") else [],
+                            "price": None,
+                            "price_str": str(match.get("price") or ""),
+                            "source_api": "google_lens",
+                            "match_type": match.get("match_type", "visual"),
+                            "relevance_score": 1.0 - (i * 0.03),  # Higher base for Lens
+                            "search_method": "Google Lens",
+                        })
+                    self.logger.info(f"✅ Google Lens returned {len(lens_products)} results")
+                except Exception as e:
+                    self.logger.warning(f"Google Lens search failed: {e}")
+            else:
+                if not public_url:
+                    self.logger.warning("ImgBB upload failed, skipping Google Lens search")
+
+            # ============================================================
+            # SECONDARY: Text Search (2-3 supplementary results)
+            # Fallback expands if Google Lens returns nothing
+            # ============================================================
+            text_search_limit = 3 if lens_products else 8  # Expand if Lens failed
+            if search_query and self.serp_client:
+                try:
+                    serp_products = self.serp_client.search_and_analyze_products(
                         query=search_query,
                         space_type=context.space_type or "general",
-                        num_results=10,
-                        similar_per_seed=3,
+                        num_results=text_search_limit + 2,  # Fetch a bit more, then trim
                     )
-                    for product in exa_products:
-                        product["source_api"] = "exa"
-                        product["search_method"] = "Exa Semantic"
-                    products.extend(exa_products)
+                    for product in serp_products[:text_search_limit]:
+                        product["source_api"] = "serp_text"
+                        product["search_method"] = "Google Shopping (Text)"
+                        product["relevance_score"] = product.get("relevance_score", 0.7)
+                    text_products.extend(serp_products[:text_search_limit])
+                    self.logger.info(f"✅ Text search returned {len(text_products)} supplementary results")
                 except Exception as e:
-                    self.logger.warning(f"Exa clip-search fetch failed: {e}")
+                    self.logger.warning(f"Text search failed: {e}")
+
+            # Combine: Lens results first (primary), then text (secondary)
+            products = lens_products + text_products
+            self.logger.info(f"📦 Combined {len(lens_products)} Lens + {len(text_products)} Text = {len(products)} total")
 
             # Deduplicate before scoring
             products = self._dedupe_products_by_url(products)
+
+            # ============================================================
+            # EXA VALIDATION: Filter to only real product pages
+            # ============================================================
+            if self.exa_client and products:
+                products = self._validate_product_pages_with_exa(products, max_validate=15, min_valid_threshold=3)
 
             # Type guard: filter decor/how-to mismatches using target_type if available
             filtered_products: List[Dict[str, Any]] = []
@@ -3084,6 +3399,11 @@ Prefer: Clear photos, unique designs, trending aesthetics, professional product 
 
             crop = image.crop((left, top, right, bottom))
 
+            # Calculate crop ratio for size-based furniture type deprioritization
+            # Small crops (<15% of image) are unlikely to be large furniture (beds, sofas)
+            crop_area = w * h  # Normalized coordinates (0-1 scale)
+            crop_ratio = crop_area  # Since full image area is 1.0 in normalized coords
+
             # Save crop temporarily to analyze with vision
             temp_dir = DATA_FILE.parent / "images" / project_id
             temp_dir.mkdir(parents=True, exist_ok=True)
@@ -3096,7 +3416,7 @@ Prefer: Clear photos, unique designs, trending aesthetics, professional product 
             target_type = None
             if self.clip_client and self.clip_client.is_available():
                 try:
-                    clip_analysis = self.clip_client.analyze_furniture_region(crop)
+                    clip_analysis = self.clip_client.analyze_furniture_region(crop, crop_ratio=crop_ratio)
                     target_type = (
                         clip_analysis.get("furniture_type", {}).get("name")
                         if clip_analysis and not clip_analysis.get("error")
@@ -3119,38 +3439,83 @@ Prefer: Clear photos, unique designs, trending aesthetics, professional product 
                     else (context.selected_product_recommendations[0] if context.selected_product_recommendations else "furniture")
                 )
 
-            # Execute SERP product search
+            # ============================================================
+            # VISUAL-FIRST PRODUCT SEARCH
+            # Primary: Google Lens (true visual search) -> direct retailer URLs
+            # Secondary: Text search (supplementary results)
+            # ============================================================
             products: List[Dict[str, Any]] = []
+            lens_products: List[Dict[str, Any]] = []
+            text_products: List[Dict[str, Any]] = []
 
-            # SERP
-            serp_products = self.serp_client.search_and_analyze_products(
-                query=search_query,
-                space_type=context.space_type or "general",
-                num_results=12,
-            )
-            for product in serp_products:
-                product["source_api"] = "serp"
-                product["search_method"] = "Google Shopping"
-            products.extend(serp_products)
+            # Upload crop to ImgBB for Google Lens (requires public URL)
+            crop_base64 = self._pil_to_base64(crop)
+            public_url = self.upload_image_to_imgbb(crop_base64)
 
-            # Exa (semantic) if available
-            if self.exa_client:
+            # ============================================================
+            # PRIMARY: Google Lens Reverse Image Search (8-10 results)
+            # Returns direct retailer URLs (not Google Shopping redirects)
+            # ============================================================
+            if public_url and self.serp_client:
                 try:
-                    exa_products = self.exa_client.search_and_analyze_products(
+                    self.logger.info(f"🔍 Running Google Lens search with public URL...")
+                    lens_results = self.serp_client.reverse_image_search_google_lens_url(public_url)
+                    for i, match in enumerate(lens_results[:10]):
+                        lens_products.append({
+                            "title": match.get("title", "Unknown Product"),
+                            "url": match.get("link") or match.get("product_link", ""),
+                            "store": match.get("source", "Unknown"),
+                            "source": match.get("source", "Unknown"),
+                            "thumbnail": match.get("thumbnail", ""),
+                            "image_url": match.get("thumbnail", ""),
+                            "images": [match.get("thumbnail")] if match.get("thumbnail") else [],
+                            "price": None,
+                            "price_str": str(match.get("price") or ""),
+                            "source_api": "google_lens",
+                            "match_type": match.get("match_type", "visual"),
+                            "relevance_score": 1.0 - (i * 0.03),  # Higher base for Lens
+                            "search_method": "Google Lens",
+                        })
+                    self.logger.info(f"✅ Google Lens returned {len(lens_products)} results")
+                except Exception as e:
+                    self.logger.warning(f"Google Lens search failed: {e}")
+            else:
+                if not public_url:
+                    self.logger.warning("ImgBB upload failed, skipping Google Lens search")
+
+            # ============================================================
+            # SECONDARY: Text Search (2-3 supplementary results)
+            # Fallback expands if Google Lens returns nothing
+            # ============================================================
+            text_search_limit = 3 if lens_products else 8  # Expand if Lens failed
+            if search_query and self.serp_client:
+                try:
+                    serp_products = self.serp_client.search_and_analyze_products(
                         query=search_query,
                         space_type=context.space_type or "general",
-                        num_results=10,
-                        similar_per_seed=3,
+                        num_results=text_search_limit + 2,  # Fetch a bit more, then trim
                     )
-                    for product in exa_products:
-                        product["source_api"] = "exa"
-                        product["search_method"] = "Exa Semantic"
-                    products.extend(exa_products)
+                    for product in serp_products[:text_search_limit]:
+                        product["source_api"] = "serp_text"
+                        product["search_method"] = "Google Shopping (Text)"
+                        product["relevance_score"] = product.get("relevance_score", 0.7)
+                    text_products.extend(serp_products[:text_search_limit])
+                    self.logger.info(f"✅ Text search returned {len(text_products)} supplementary results")
                 except Exception as e:
-                    self.logger.warning(f"Exa clip-search fetch failed: {e}")
+                    self.logger.warning(f"Text search failed: {e}")
+
+            # Combine: Lens results first (primary), then text (secondary)
+            products = lens_products + text_products
+            self.logger.info(f"📦 Combined {len(lens_products)} Lens + {len(text_products)} Text = {len(products)} total")
 
             # Deduplicate before scoring
             products = self._dedupe_products_by_url(products)
+
+            # ============================================================
+            # EXA VALIDATION: Filter to only real product pages
+            # ============================================================
+            if self.exa_client and products:
+                products = self._validate_product_pages_with_exa(products, max_validate=15, min_valid_threshold=3)
 
             # Type guard: filter decor/how-to mismatches using target_type if available
             filtered_products: List[Dict[str, Any]] = []
@@ -3463,7 +3828,25 @@ Prefer: Clear photos, unique designs, trending aesthetics, professional product 
             project_dir = DATA_FILE.parent / "images" / project_id
 
             # Generate the visualization with multi-product context
-            generated_image_base64, final_prompt = (
+            # Pass improvement_mode to determine which prompt to use
+            improvement_mode = getattr(context, 'improvement_mode', None)
+            print(f"📋 Improvement mode: {improvement_mode or 'complete_revamp (default)'}")
+
+            # Get trending products for iterative mode styling suggestions
+            trending_products = []
+            if improvement_mode == "iterative":
+                # Collect trending products from context for additional styling recommendations
+                if hasattr(context, 'selected_trending_products') and context.selected_trending_products:
+                    trending_products.extend(context.selected_trending_products[:2])
+                    print(f"📈 Including {len(trending_products)} trending products for styling suggestions")
+                if hasattr(context, 'favorite_products') and context.favorite_products:
+                    # Add favorites that aren't already selected
+                    for fav in context.favorite_products[:2]:
+                        if fav not in trending_products:
+                            trending_products.append(fav)
+                    print(f"⭐ Total styling suggestions: {len(trending_products)}")
+
+            generated_image_base64, final_prompt, model_used = (
                 self.gemini_client.generate_product_visualization(
                     original_room_image_path=str(original_room_image_path),
                     selected_products=selected_products,
@@ -3475,12 +3858,15 @@ Prefer: Clear photos, unique designs, trending aesthetics, professional product 
                     project_data_dir=project_dir,
                     color_scheme=getattr(context, 'color_scheme', None),
                     design_style=getattr(context, 'design_style', None),
+                    improvement_mode=improvement_mode,
+                    trending_products=trending_products,
                 )
             )
 
             # Update context with generated image base64
             context.generated_image_base64 = generated_image_base64
             context.generation_prompt = final_prompt
+            context.generation_model_used = model_used
 
             # Save context
             projects = self._load_projects()
@@ -3494,6 +3880,7 @@ Prefer: Clear photos, unique designs, trending aesthetics, professional product 
                 {
                     "project_id": project_id,
                     "generated_image_size": f"{len(generated_image_base64)} chars",
+                    "model_used": model_used,
                 },
             )
 
@@ -3504,6 +3891,7 @@ Prefer: Clear photos, unique designs, trending aesthetics, professional product 
                 "generation_prompt": final_prompt,
                 "status": "success",
                 "message": "Image generated successfully using Gemini",
+                "model_used": model_used,
             }
 
         except Exception as e:
@@ -3587,74 +3975,128 @@ Prefer: Clear photos, unique designs, trending aesthetics, professional product 
             # Get space type for prompt
             space_type = context.space_type or "living space"
 
-            # 1. Build DESIGN CONTEXT
-            design_context_lines = []
-            
-            # Inspiration
-            if context.inspiration_recommendations and len(context.inspiration_recommendations) > 0:
-                design_context_lines.append("INSPIRATION GOALS:")
-                # We clean every string we inject
-                design_context_lines.extend([f"- {clean(rec)}" for rec in context.inspiration_recommendations[:5]])
-                design_context_lines.append("") # Blank line for spacing
-            
-            # Improvement Markers
-            if context.improvement_markers:
-                design_context_lines.append("AREAS TO IMPROVE:")
-                design_context_lines.extend([f"- {clean(m.description)}" for m in context.improvement_markers])
-                design_context_lines.append("")
+            # Determine which prompt to use based on:
+            # 1. Has inspiration images uploaded? -> Use inspiration prompt
+            # 2. Otherwise, check improvement_mode: iterative vs complete_revamp
+            improvement_mode = getattr(context, 'improvement_mode', None)
+            has_inspiration_images = len(context.inspiration_images or []) > 0
 
-            # Color Analysis
-            if context.color_analysis:
-                ca = context.color_analysis
-                design_context_lines.append("COLOR GUIDELINES:")
-                design_context_lines.append(f"- Palette: {clean(ca.get('palette_name', 'Custom'))}")
-                
-                # Fix: primary_colors is a list of ColorSwatch dicts, not strings
-                if ca.get('primary_colors'):
-                    # Handle both list of strings (legacy) and list of dicts (ColorSwatch)
-                    p_colors = []
-                    for c in ca.get('primary_colors', []):
-                        if isinstance(c, dict):
-                            # Extract hex and description
-                            c_str = c.get('hex', '')
-                            if c.get('description'):
-                                c_str += f" ({c.get('description')})"
-                            p_colors.append(c_str)
-                        elif isinstance(c, str):
-                            p_colors.append(c)
-                        else:
-                            p_colors.append(str(c))
-                    
-                    design_context_lines.append(f"- Primary Colors: {clean(', '.join(p_colors))}")
-                
-                design_context_lines.append(f"- Lighting Notes: {clean(ca.get('lighting_notes', 'N/A'))}")
-                design_context_lines.append("")
+            # ========================================
+            # DETAILED LOGGING FOR PROMPT SELECTION
+            # ========================================
+            print("\n" + "="*70)
+            print("🎯 PROMPT SELECTION DEBUG INFO")
+            print("="*70)
+            print(f"📋 improvement_mode value: '{improvement_mode}' (type: {type(improvement_mode).__name__})")
+            print(f"📸 has_inspiration_images: {has_inspiration_images}")
+            print(f"   - inspiration_images count: {len(context.inspiration_images or [])}")
+            print(f"   - inspiration_images_skipped: {getattr(context, 'inspiration_images_skipped', 'not set')}")
+            print(f"📝 Selected product recommendations: {context.selected_product_recommendations}")
+            print(f"🎨 Color scheme: {context.color_scheme}")
+            print(f"🪑 Style analysis: {context.style_analysis.get('style_name') if context.style_analysis else 'None'}")
+            print(f"📍 Improvement markers: {len(context.improvement_markers or [])} markers")
+            for i, marker in enumerate(context.improvement_markers or []):
+                print(f"   - Marker {i+1}: {marker.description}")
+            print("-"*70)
 
-            # Style Analysis
-            if context.style_analysis:
-                sa = context.style_analysis
-                design_context_lines.append("STYLE GUIDELINES:")
-                design_context_lines.append(f"- Style: {clean(sa.get('style_name', 'Custom'))}")
-                if sa.get('materials'):
-                    design_context_lines.append(f"- Materials: {clean(', '.join(sa.get('materials')))}")
-                design_context_lines.append(f"- Characteristics: {clean(sa.get('furniture_characteristics', 'N/A'))}")
-                
-            # Join and ensure we don't return an empty block if no data exists
-            design_context_str = "\n".join(design_context_lines) if design_context_lines else "General Modern Upgrade"
+            # Determine which prompt will be used
+            if has_inspiration_images:
+                prompt_type = "INSPIRATION"
+                prompt_reason = "Inspiration images were uploaded"
+            elif improvement_mode == "iterative":
+                prompt_type = "ITERATIVE"
+                prompt_reason = "User selected 'iterative' mode - surgical edits only"
+            else:
+                prompt_type = "INTEGRATION (REVAMP)"
+                prompt_reason = f"User selected '{improvement_mode or 'complete_revamp (default)'}' mode - full redesign"
 
-            # 2. Build PRODUCT UPDATES
-            product_list_str = "None specified"
-            
-            # Logic: Using existing has_products flag or re-deriving
-            selected_recs = context.selected_product_recommendations or []
-            ai_recs = context.product_recommendations or []
-            product_source = selected_recs if len(selected_recs) > 0 else ai_recs
-            
-            if product_source:
-                product_list_str = "\n".join([f"- {clean(rec)}" for rec in product_source[:5]])
+            print(f"✅ PROMPT TYPE SELECTED: {prompt_type}")
+            print(f"   Reason: {prompt_reason}")
+            print("="*70 + "\n")
 
-            # 3. Final Prompt Construction - PHOTOREALISM FOCUSED
-            prompt = f"""### ROLE & OBJECTIVE
+            # Get selected trending products for all prompt types
+            selected_trending = context.selected_trending_products or []
+
+            # Branch based on inspiration images and improvement mode
+            if has_inspiration_images:
+                # ============================================
+                # INSPIRATION PROMPT (photorealistic redesign)
+                # Only used when actual inspiration images were uploaded
+                # ============================================
+                print("🎨 Using INSPIRATION prompt (photorealistic redesign with uploaded images)")
+
+                # 1. Build DESIGN CONTEXT for inspiration prompt
+                design_context_lines = []
+
+                # Inspiration
+                if context.inspiration_recommendations and len(context.inspiration_recommendations) > 0:
+                    design_context_lines.append("INSPIRATION GOALS:")
+                    design_context_lines.extend([f"- {clean(rec)}" for rec in context.inspiration_recommendations[:5]])
+                    design_context_lines.append("")
+
+                # Improvement Markers
+                if context.improvement_markers:
+                    design_context_lines.append("AREAS TO IMPROVE:")
+                    design_context_lines.extend([f"- {clean(m.description)}" for m in context.improvement_markers])
+                    design_context_lines.append("")
+
+                # Color Analysis
+                if context.color_analysis:
+                    ca = context.color_analysis
+                    design_context_lines.append("COLOR GUIDELINES:")
+                    design_context_lines.append(f"- Palette: {clean(ca.get('palette_name', 'Custom'))}")
+
+                    if ca.get('primary_colors'):
+                        p_colors = []
+                        for c in ca.get('primary_colors', []):
+                            if isinstance(c, dict):
+                                c_str = c.get('hex', '')
+                                if c.get('description'):
+                                    c_str += f" ({c.get('description')})"
+                                p_colors.append(c_str)
+                            elif isinstance(c, str):
+                                p_colors.append(c)
+                            else:
+                                p_colors.append(str(c))
+
+                        design_context_lines.append(f"- Primary Colors: {clean(', '.join(p_colors))}")
+
+                    design_context_lines.append(f"- Lighting Notes: {clean(ca.get('lighting_notes', 'N/A'))}")
+                    design_context_lines.append("")
+
+                # Style Analysis
+                if context.style_analysis:
+                    sa = context.style_analysis
+                    design_context_lines.append("STYLE GUIDELINES:")
+                    design_context_lines.append(f"- Style: {clean(sa.get('style_name', 'Custom'))}")
+                    if sa.get('materials'):
+                        design_context_lines.append(f"- Materials: {clean(', '.join(sa.get('materials')))}")
+                    design_context_lines.append(f"- Characteristics: {clean(sa.get('furniture_characteristics', 'N/A'))}")
+
+                design_context_str = "\n".join(design_context_lines) if design_context_lines else "General Modern Upgrade"
+
+                # 2. Build PRODUCT UPDATES
+                product_list_str = "None specified"
+                selected_recs = context.selected_product_recommendations or []
+                ai_recs = context.product_recommendations or []
+                primary_recs = list(selected_recs) if selected_recs else []
+                complementary_recs = []
+                if ai_recs:
+                    non_selected = [r for r in ai_recs if r not in selected_recs]
+                    complementary_recs = non_selected[:2]
+
+                if primary_recs or complementary_recs:
+                    parts = []
+                    if primary_recs:
+                        parts.append("PRIMARY CHANGES (User Selected):\n" +
+                                     "\n".join([f"- {clean(rec)}" for rec in primary_recs[:5]]))
+                    if complementary_recs:
+                        parts.append("COMPLEMENTARY ENHANCEMENTS (AI Suggested - optional):\n" +
+                                     "\n".join([f"- {clean(rec)}" for rec in complementary_recs]))
+                    product_list_str = "\n\n".join(parts)
+
+                # 3. Inspiration Prompt - PHOTOREALISM FOCUSED
+                prompt = f"""### ROLE & OBJECTIVE
 You are a master of Architectural Photography and Interior Restoration. Your task is to modify the provided photograph (the input image) by replacing specific furniture and decor while maintaining the exact architectural shell and original camera properties. The goal is a "Real-Life" photograph, not a digital render.
 
 ### 1. STRUCTURAL LOCKDOWN (ABSOLUTE REQUIREMENT)
@@ -3698,8 +4140,10 @@ SPACE TYPE: {clean(space_type)}
 
 {design_context_str}
 
-FURNITURE REPLACEMENTS:
+FURNITURE UPDATES:
 {product_list_str}
+
+IMPORTANT: Prioritize PRIMARY CHANGES (user-selected). COMPLEMENTARY ENHANCEMENTS are optional improvements to consider if they enhance the overall design cohesion.
 
 DECOR & TEXTILES:
 - If adding a rug, ensure it tucks realistically under nearby furniture legs.
@@ -3711,10 +4155,102 @@ DECLUTTERING: Remove all small loose items, trash, and visible cables from desks
 ### 4. OUTPUT REQUIREMENT
 Generate a high-resolution photograph. If the image looks like a "3D concept render" or has a smooth, plastic, digital art appearance, it has FAILED. It MUST look like a "before and after" photo taken by the same camera in the same physical room. The final image should be indistinguishable from a real photograph shot for a high-end interior design magazine."""
 
-            print(f"🎨 Inspiration redesign prompt: {prompt[:200]}...")
+            elif improvement_mode == "iterative":
+                # ============================================
+                # ITERATIVE PROMPT (surgical edits only)
+                # No color/style enforcement, minimal changes
+                # ============================================
+                print("🔧 Using ITERATIVE prompt (surgical edits, no color/style enforcement)")
 
-            # Get selected trending products for image generation
-            selected_trending = context.selected_trending_products or []
+                # Format selected products for iterative prompt
+                selected_products_formatted = []
+                for p in selected_trending:
+                    selected_products_formatted.append({
+                        'title': p.get('title', 'Unknown product'),
+                        'store': p.get('store', 'Unknown'),
+                    })
+
+                # Use the iterative prompt from gemini_client
+                prompt = self.gemini_client._create_iterative_prompt(
+                    selected_products=selected_products_formatted,
+                    marker_locations=context.improvement_markers or [],
+                )
+
+            else:
+                # ============================================
+                # INTEGRATION/REVAMP PROMPT (comprehensive redesign)
+                # Full color/style enforcement, AI-coordinated design
+                # ============================================
+                print("🎨 Using INTEGRATION prompt (full redesign with color/style enforcement)")
+
+                # Prepare product titles for integration prompt
+                product_titles = []
+                for p in selected_trending:
+                    if p.get('title'):
+                        product_titles.append(p.get('title'))
+
+                # Add selected recommendations if no trending products
+                if not product_titles:
+                    product_titles = context.selected_product_recommendations or []
+
+                # Use the integration prompt from gemini_client
+                prompt = self.gemini_client._create_integration_prompt(
+                    space_type=space_type,
+                    product_titles=product_titles,
+                    inspiration_recommendations=context.inspiration_recommendations or [],
+                    marker_locations=context.improvement_markers or [],
+                    custom_prompt=None,
+                    color_scheme=context.color_scheme,
+                    design_style=context.style_analysis,
+                )
+
+            # ========================================
+            # FINAL PROMPT VERIFICATION
+            # ========================================
+            actual_prompt_type = 'INSPIRATION' if has_inspiration_images else ('ITERATIVE' if improvement_mode == 'iterative' else 'INTEGRATION')
+            print("\n" + "="*70)
+            print("📝 FINAL PROMPT VERIFICATION")
+            print("="*70)
+            print(f"✅ Prompt type used: {actual_prompt_type}")
+            print(f"📏 Prompt length: {len(prompt)} characters")
+
+            # Show the role line to verify correct prompt
+            first_lines = prompt.split('\n')[:5]
+            print(f"📄 Prompt starts with:")
+            for line in first_lines:
+                if line.strip():
+                    print(f"   {line[:100]}...")
+                    break
+
+            # Check for key indicators of each prompt type
+            if "Elite Interior Design Visualizer" in prompt:
+                print("🔍 DETECTED: INTEGRATION/REVAMP prompt (Elite Interior Design Visualizer)")
+                print("   ✓ Should apply full color/style enforcement")
+                print("   ✓ Should auto-generate matching accessories")
+                print("   ✓ Should create cohesive high-end look")
+            elif "High-End Virtual Stager" in prompt:
+                print("🔍 DETECTED: ITERATIVE prompt (High-End Virtual Stager)")
+                print("   ✓ Should make surgical edits only")
+                print("   ✓ Should NOT change color/style")
+                print("   ✓ Should keep room mostly the same")
+            elif "master of Architectural Photography" in prompt:
+                print("🔍 DETECTED: INSPIRATION prompt (Architectural Photography)")
+                print("   ✓ Should create photorealistic result")
+                print("   ✓ Should use inspiration images as reference")
+            else:
+                print("⚠️ WARNING: Could not detect prompt type from content!")
+
+            # Verify mode matches prompt
+            if improvement_mode == "iterative" and "Elite Interior Design Visualizer" in prompt:
+                print("❌ ERROR: Mode is 'iterative' but using INTEGRATION prompt!")
+            elif improvement_mode != "iterative" and "High-End Virtual Stager" in prompt:
+                print("❌ ERROR: Mode is NOT 'iterative' but using ITERATIVE prompt!")
+            else:
+                print("✅ Mode and prompt type MATCH correctly")
+
+            print("="*70 + "\n")
+
+            # Prepare product images for Gemini (selected_trending already declared above)
             product_images_for_gemini = None
             if selected_trending:
                 product_images_for_gemini = [
@@ -3727,19 +4263,16 @@ Generate a high-resolution photograph. If the image looks like a "3D concept ren
                 )
 
             # Call Gemini API using the new method
-            generated_image_base64 = self.gemini_client.generate_room_redesign(
+            generated_image_base64, model_used = self.gemini_client.generate_room_redesign(
                 original_room_image_path=original_room_image_path,
                 prompt=prompt,
                 product_images=product_images_for_gemini
             )
 
-            # Assign to generated_image_base64 for the rest of the function to use
-            # (which already expects this variable name)
-
-
             # Update context with generated image
             context.inspiration_generated_image_base64 = generated_image_base64
             context.inspiration_generation_prompt = prompt
+            context.inspiration_model_used = model_used
 
             # Save context
             projects = self._load_projects()
@@ -3755,6 +4288,7 @@ Generate a high-resolution photograph. If the image looks like a "3D concept ren
                 {
                     "project_id": project_id,
                     "image_size": f"{len(generated_image_base64)} chars",
+                    "model_used": model_used,
                 },
             )
 
@@ -3765,12 +4299,210 @@ Generate a high-resolution photograph. If the image looks like a "3D concept ren
                 "inspiration_recommendations": context.inspiration_recommendations,
                 "status": "success",
                 "message": "Inspiration-based redesign completed successfully",
+                "model_used": model_used,
             }
 
         except Exception as e:
             self.logger.error(f"Failed to generate inspiration redesign: {e}")
             log_external_api_call("gemini", "inspiration_redesign", 0, False)
             raise
+
+    def retry_inspiration_redesign(self, project_id: str, feedback: str):
+        """
+        Apply user-directed modifications to the existing generated image.
+
+        This is a SURGICAL EDIT operation - takes the last generated image
+        and applies only the specific changes the user requested.
+
+        Args:
+            project_id: The project ID
+            feedback: User's modification request (e.g., "remove the lamp")
+
+        Returns:
+            Dict with edited image and metadata
+        """
+        try:
+            log_user_action("retry_redesign_started", {
+                "project_id": project_id,
+                "feedback": feedback[:100]
+            })
+
+            # Load project context
+            project = self.get_project(project_id)
+            if not project:
+                raise ValueError(f"Project {project_id} not found")
+
+            context = ProjectContext.model_validate(project["context"])
+
+            # Check that we have a generated image to edit
+            if not context.inspiration_generated_image_base64:
+                raise ValueError(
+                    "No generated image available to edit. Please generate an image first."
+                )
+
+            if not self.gemini_client:
+                raise ValueError("Gemini client is not available")
+
+            if not feedback or not feedback.strip():
+                raise ValueError("Feedback cannot be empty")
+
+            print(f"✏️ Retry redesign: Applying user feedback to existing image")
+            print(f"   Feedback: '{feedback[:100]}...'")
+
+            # Call Gemini to edit the image (returns image, model, and full prompt)
+            edited_image_base64, model_used, full_prompt = self.gemini_client.edit_room_with_feedback(
+                generated_image_base64=context.inspiration_generated_image_base64,
+                user_feedback=feedback.strip()
+            )
+
+            # Update context with edited image and full prompt
+            context.inspiration_generated_image_base64 = edited_image_base64
+            context.inspiration_generation_prompt = full_prompt  # Store full prompt for debugging
+            context.inspiration_model_used = model_used
+
+            # Save context
+            projects = self._load_projects()
+            projects[project_id]["context"] = context.model_dump()
+            self._save_projects(projects)
+
+            log_user_action(
+                "retry_redesign_completed",
+                {
+                    "project_id": project_id,
+                    "feedback": feedback[:100],
+                    "model_used": model_used,
+                },
+            )
+
+            return {
+                "project_id": project_id,
+                "generated_image_base64": edited_image_base64,
+                "inspiration_prompt": full_prompt,  # Return full prompt for UI display
+                "inspiration_recommendations": context.inspiration_recommendations or [],
+                "status": "success",
+                "message": "Image edited successfully based on your feedback",
+                "model_used": model_used,
+            }
+
+        except Exception as e:
+            self.logger.error(f"Failed to retry redesign: {e}")
+            log_external_api_call("gemini", "retry_redesign", 0, False)
+            raise
+
+    def _validate_click_on_primary(
+        self,
+        click_x: float,
+        click_y: float,
+        detection: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Validate that the primary item contains the click point.
+        If not, swap with a better candidate from additional_items.
+
+        This fixes issues where clicking on a small item (lamp) on a larger item
+        (nightstand) returns the larger item as primary.
+
+        Scoring based on:
+        1. Click containment (is click inside bbox?) - 100 points
+        2. Smaller area preferred (more specific) - up to 50 points
+        3. Closer to click center - up to 10 points
+
+        Args:
+            click_x: Normalized x coordinate (0-1)
+            click_y: Normalized y coordinate (0-1)
+            detection: Detection result from Gemini spatial detector
+
+        Returns:
+            Updated detection dict with potentially swapped primary/additional items
+        """
+        additional = detection.get("additional_items", [])
+
+        if not additional:
+            return detection  # Nothing to swap with
+
+        # Build list of all candidate items
+        primary = {
+            "label": detection["label"],
+            "bbox_normalized": detection.get("bbox_normalized", [0, 0, 1, 1]),
+            "color": detection.get("attributes", {}).get("color", "unknown"),
+            "material": detection.get("attributes", {}).get("material", "unknown"),
+            "style": detection.get("attributes", {}).get("style", "unknown"),
+            "search_query": detection.get("search_query", detection["label"]),
+        }
+
+        all_items = [primary] + additional
+        scored = []
+
+        for item in all_items:
+            bbox = item.get("bbox_normalized", [0, 0, 1, 1])
+
+            # Handle both [ymin, xmin, ymax, xmax] and ensure we have 4 values
+            if len(bbox) != 4:
+                bbox = [0, 0, 1, 1]
+
+            ymin, xmin, ymax, xmax = bbox
+
+            # Sanity check - swap if reversed
+            if ymin > ymax:
+                ymin, ymax = ymax, ymin
+            if xmin > xmax:
+                xmin, xmax = xmax, xmin
+
+            # Check if click is inside this bbox
+            click_inside = (ymin <= click_y <= ymax and xmin <= click_x <= xmax)
+
+            # Calculate distance from click to item center
+            center_x = (xmin + xmax) / 2
+            center_y = (ymin + ymax) / 2
+            distance = ((click_x - center_x) ** 2 + (click_y - center_y) ** 2) ** 0.5
+
+            # Calculate area (smaller = more specific, preferred for overlapping items)
+            area = (ymax - ymin) * (xmax - xmin)
+
+            # Score calculation
+            score = 0
+            if click_inside:
+                score += 100  # Major bonus for containment
+                score += 50 * (1 - min(area, 1))  # Smaller area = higher score
+                score += 10 * (1 - min(distance, 1))  # Closer center = higher score
+            else:
+                # Not inside - only give distance bonus (weak candidate)
+                score += 10 * (1 - min(distance, 1))
+
+            item["_selection_score"] = score
+            scored.append(item)
+
+        # Sort by score descending
+        scored.sort(key=lambda x: x.get("_selection_score", 0), reverse=True)
+        best = scored[0]
+
+        # If best is different from original primary, swap
+        original_label = detection["label"]
+        if best.get("label") != original_label:
+            print(f"   🔄 Click validation: Switching '{original_label}' → '{best['label']}' (score: {best.get('_selection_score', 0):.1f})")
+
+            detection["label"] = best["label"]
+            detection["bbox_normalized"] = best.get("bbox_normalized", detection.get("bbox_normalized"))
+            detection["search_query"] = best.get("search_query", best["label"])
+            detection["attributes"] = {
+                "color": best.get("color", "unknown"),
+                "material": best.get("material", "unknown"),
+                "style": best.get("style", detection.get("attributes", {}).get("style", "unknown")),
+            }
+
+            # Update additional_items to exclude the new primary and include old primary
+            new_additional = []
+            for item in scored[1:]:
+                item.pop("_selection_score", None)
+                if item.get("label") != best.get("label"):
+                    new_additional.append(item)
+            detection["additional_items"] = new_additional
+
+        # Clean up scores from items
+        for item in scored:
+            item.pop("_selection_score", None)
+
+        return detection
 
     @log_api_call("analyze_furniture_batch")
     def analyze_furniture_batch(
@@ -3873,11 +4605,69 @@ Generate a high-resolution photograph. If the image looks like a "3D concept ren
                         image_height=height,
                         space_type=context.space_type  # Pass space_type for smarter fallback
                     )
-                    
+
+                    # ============================================================
+                    # CLICK VALIDATION: Ensure primary item contains click point
+                    # Fixes lamp-on-nightstand issue where larger item is returned
+                    # ============================================================
+                    detection = self._validate_click_on_primary(x, y, detection)
+
+                    # ============================================================
+                    # SMART ITEM SELECTION: Prefer smaller items when overlapping
+                    # E.g., lamp ON sidetable - user clicking lamp should get lamp
+                    # ============================================================
                     label = detection["label"]
                     attributes = detection.get("attributes", {})
                     search_query = detection.get("search_query", label)
                     bbox_norm = detection.get("bbox_normalized", [0.3, 0.3, 0.7, 0.7])
+
+                    additional_items = detection.get("additional_items", [])
+                    if additional_items:
+                        print(f"   🔄 Found {len(additional_items)} additional items: {[a['label'] for a in additional_items]}")
+
+                        # Calculate primary bbox area and center distance
+                        primary_ymin, primary_xmin, primary_ymax, primary_xmax = bbox_norm
+                        primary_area = (primary_ymax - primary_ymin) * (primary_xmax - primary_xmin)
+
+                        # Enhanced smart selection with weighted scoring
+                        best_candidate = None
+                        best_score = 0
+
+                        for item in additional_items:
+                            item_bbox = item.get("bbox_normalized", [0, 0, 1, 1])
+                            item_ymin, item_xmin, item_ymax, item_xmax = item_bbox
+                            item_area = (item_ymax - item_ymin) * (item_xmax - item_xmin)
+
+                            # Check if click is inside this item's bbox
+                            click_in_item = (item_ymin <= y <= item_ymax and item_xmin <= x <= item_xmax)
+
+                            if not click_in_item:
+                                continue
+
+                            # Score based on: smaller area + closer to click center
+                            area_score = 1.0 - min(item_area / max(primary_area, 0.001), 1.0)
+                            item_center = ((item_xmin + item_xmax) / 2, (item_ymin + item_ymax) / 2)
+                            distance = ((x - item_center[0]) ** 2 + (y - item_center[1]) ** 2) ** 0.5
+                            distance_score = 1.0 - min(distance, 1.0)
+
+                            # Weight: 70% area preference (smaller = better), 30% distance
+                            score = 0.7 * area_score + 0.3 * distance_score
+
+                            if score > best_score:
+                                best_score = score
+                                best_candidate = item
+
+                        # Switch to best candidate if found a good match
+                        if best_candidate and best_score > 0.2:
+                            print(f"   ✨ Switching to '{best_candidate['label']}' (score: {best_score:.2f})")
+                            label = best_candidate.get("label", label)
+                            attributes = {
+                                "color": best_candidate.get("color", "unknown"),
+                                "material": best_candidate.get("material", "unknown"),
+                                "style": attributes.get("style", "unknown"),
+                            }
+                            search_query = best_candidate.get("search_query", label)
+                            bbox_norm = best_candidate.get("bbox_normalized", bbox_norm)
                     
                     print(f"   📍 Click at ({x:.2f}, {y:.2f}) -> Detected: '{label}'")
                     print(f"   📦 BBox: {bbox_norm}")
@@ -3903,7 +4693,10 @@ Generate a high-resolution photograph. If the image looks like a "3D concept ren
                     if detection.get("fallback") and self.clip_client and self.clip_client.is_available():
                         print(f"   🔍 Gemini fallback triggered - using CLIP to classify crop...")
                         try:
-                            clip_analysis = self.clip_client.analyze_furniture_region(crop)
+                            # Calculate crop_ratio from normalized bounding box
+                            # bbox_norm format: [x1, y1, x2, y2]
+                            crop_ratio = (bbox_norm[2] - bbox_norm[0]) * (bbox_norm[3] - bbox_norm[1])
+                            clip_analysis = self.clip_client.analyze_furniture_region(crop, crop_ratio=crop_ratio)
                             if clip_analysis and "error" not in clip_analysis:
                                 furniture_type = clip_analysis.get("furniture_type", {})
                                 clip_confidence = furniture_type.get("confidence", 0)
@@ -4044,7 +4837,8 @@ Generate a high-resolution photograph. If the image looks like a "3D concept ren
                             style=attributes.get("style", ""),
                             color=attributes.get("color", ""),
                             material=attributes.get("material", ""),
-                            detected_components=detected_components  # Pass detected components
+                            detected_components=detected_components,  # Pass detected components
+                            main_products=all_products,  # Pass Google Lens visual results for bed_frame
                         )
                         # Log bed component results
                         if bed_components:
@@ -4168,6 +4962,21 @@ Generate a high-resolution photograph. If the image looks like a "3D concept ren
                 print(f"   🛏️ Detected bedding item '{label}' - will search for ALL bed components")
                 return True
 
+        # Step 6: Check for bed-like contextual patterns that Gemini might return
+        # These patterns suggest bed-sized upholstered furniture
+        bed_contextual_patterns = [
+            ("tufted", "upholstered"),    # "tufted upholstered" furniture is often a bed
+            ("channel", "tufted"),         # "channel tufted" furniture is often a bed
+            ("wingback", "upholstered"),   # "wingback upholstered" is often a bed headboard
+            ("button", "tufted"),          # "button tufted" large furniture is often a bed
+            ("velvet", "upholstered"),     # Large velvet upholstered furniture may be a bed
+        ]
+        for pattern in bed_contextual_patterns:
+            if all(p in label_lower for p in pattern):
+                self.logger.info(f"Bed check: '{label}' matched contextual bed pattern {pattern}")
+                print(f"   🛏️ Detected bed-like pattern '{pattern}' in '{label}' - treating as bed")
+                return True
+
         return False
 
     def _detect_bed_sub_components(
@@ -4272,7 +5081,8 @@ If a component is not visible or unclear, set visible=false.
         style: str = "",
         color: str = "",
         material: str = "",
-        detected_components: Dict[str, Dict[str, Any]] = None
+        detected_components: Dict[str, Dict[str, Any]] = None,
+        main_products: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, List[Dict[str, Any]]]:
         """
         Search for bed component products (frame, bedding, throw, pillows).
@@ -4294,6 +5104,42 @@ If a component is not visible or unclear, set visible=false.
 
         components_results = {}
         detected_components = detected_components or {}
+
+        # For bed_frame: Use main Google Lens visual search results
+        # These are from searching the actual bed image, not text queries
+        if main_products:
+            bed_keywords = ["bed", "frame", "headboard", "platform", "upholstered"]
+            bed_frame_products = [
+                p for p in main_products
+                if any(kw in (p.get("title") or "").lower() for kw in bed_keywords)
+            ][:4]
+
+            if bed_frame_products:
+                # Format products to match expected structure
+                formatted_bed_frame = []
+                for p in bed_frame_products:
+                    image_url = ""
+                    images = p.get("images", [])
+                    if images and len(images) > 0:
+                        image_url = images[0]
+                    elif p.get("thumbnail"):
+                        image_url = p.get("thumbnail")
+                    elif p.get("image"):
+                        image_url = p.get("image")
+                    elif p.get("image_url"):
+                        image_url = p.get("image_url")
+
+                    formatted_bed_frame.append({
+                        "url": p.get("url", p.get("product_link", p.get("link", ""))),
+                        "title": p.get("title", ""),
+                        "image_url": image_url,
+                        "store": p.get("store", p.get("source", "Unknown")),
+                        "price_str": p.get("price_str", str(p.get("price", "")) if p.get("price") else ""),
+                        "price": p.get("price") if isinstance(p.get("price"), (int, float)) else None,
+                    })
+
+                components_results["bed_frame"] = formatted_bed_frame
+                print(f"   🛏️ bed_frame: Using {len(formatted_bed_frame)} products from visual search")
 
         def search_component(component_key: str, component_config: Dict) -> tuple:
             """Search for a single bed component."""
@@ -4415,11 +5261,12 @@ If a component is not visible or unclear, set visible=false.
                 self.logger.error(f"Failed to search bed component {component_key}: {e}")
                 return (component_key, [])
 
-        # Search all components in parallel
+        # Search all components in parallel (skip bed_frame if already populated from visual search)
         with ThreadPoolExecutor(max_workers=4) as executor:
             futures = {
                 executor.submit(search_component, key, config): key
                 for key, config in BED_COMPONENTS.items()
+                if key not in components_results  # Skip if already populated (e.g., bed_frame from visual search)
             }
 
             for future in as_completed(futures):
@@ -4587,35 +5434,62 @@ If a component is not visible or unclear, set visible=false.
                 bottom = min(height, int((y + box_size/2) * height))
                 crop = image.crop((left, top, right, bottom))
 
-                # Save temporary crop
-                temp_dir = DATA_FILE.parent / "images" / project_id / "reverse"
-                temp_dir.mkdir(parents=True, exist_ok=True)
                 sel_id = sel.id if hasattr(sel, 'id') else sel.get('id', 'sel')
-                crop_path = temp_dir / f"lens_{sel_id}.png"
-                crop.save(crop_path)
 
-                # Prepare SerpAPI Google Lens call
+                # Upload crop to ImgBB for public URL (required for Google Lens)
+                crop_base64 = self._pil_to_base64(crop)
+                public_url = self.upload_image_to_imgbb(crop_base64)
+
+                # Perform Google Lens search
                 matches = []
-                if self.serp_client:
+                if self.serp_client and public_url:
                     try:
-                        # Reuse serp_client but switch engine inside client method
-                        from serp_client import SerpClient
-                        serp = self.serp_client  # already configured
-                        serp_results = serp.reverse_image_search_google_lens(str(crop_path))
-                        # Normalize
+                        serp_results = self.serp_client.reverse_image_search_google_lens_url(public_url)
+                        # Normalize results
                         for m in serp_results[:10]:
                             matches.append({
                                 "title": m.get("title"),
-                                "url": m.get("link") or m.get("product_link") or m.get("source") or None,
+                                "url": m.get("link") or m.get("product_link", ""),
                                 "source": m.get("source"),
                                 "thumbnail": m.get("thumbnail"),
+                                "match_type": m.get("match_type", "visual"),
                             })
                     except Exception as e:
                         self.logger.warning(f"Reverse search failed for {sel_id}: {e}")
+                elif not public_url:
+                    self.logger.warning(f"ImgBB upload failed for {sel_id}, skipping Google Lens")
+
+                # Validate matches with Exa (filter non-product pages)
+                if self.exa_client and matches:
+                    urls_to_validate = [m.get("url") for m in matches if m.get("url")]
+                    if urls_to_validate:
+                        validation_results = self.exa_client.validate_product_urls_batch(
+                            urls=urls_to_validate,
+                            batch_size=5,
+                            max_chars=2000
+                        )
+                        # Filter to only valid product pages
+                        validated_matches = []
+                        for m in matches:
+                            url = m.get("url", "")
+                            if url in validation_results:
+                                if validation_results[url].get("is_valid"):
+                                    m["exa_validated"] = True
+                                    validated_matches.append(m)
+                            else:
+                                # URL wasn't validated, include with warning
+                                m["exa_validated"] = False
+                                validated_matches.append(m)
+
+                        # Fallback: if fewer than 3 pass, return original
+                        if len(validated_matches) >= 3 or len(matches) < 3:
+                            matches = validated_matches
+                        else:
+                            self.logger.warning(f"Only {len(validated_matches)} matches passed Exa validation, returning unfiltered")
 
                 results.append({
                     "id": sel_id,
-                    "image_url": None,  # Could integrate imgbb for public URL
+                    "image_url": public_url,
                     "matches": matches,
                 })
 

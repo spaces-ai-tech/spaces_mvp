@@ -244,3 +244,20 @@ websockets==15.0.1
     # via
     #   google-genai
     #   uvicorn
+
+# ============================================================
+# URL Normalizer dependencies (manually added)
+# ============================================================
+tldextract>=5.0.0
+    # PSL-based domain extraction for retailer grouping
+beautifulsoup4>=4.12.0
+    # HTML parsing for canonical extraction
+lxml>=5.0.0
+    # Fast HTML parser backend for BeautifulSoup
+
+# ============================================================
+# VAPO (Vertex AI Prompt Optimizer) dependencies
+# ============================================================
+google-cloud-aiplatform>=1.38.0
+    # Vertex AI SDK for prompt optimization
+    # Includes vertexai.preview.prompt_optimizer

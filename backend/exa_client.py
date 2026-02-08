@@ -714,6 +714,8 @@ class ExaClient:
             "google.com/url?",
             "shopping.google.com",
             "google.com/aclk",
+            "ibp=oshop",  # Google Shopping search results
+            "google.com/search?ibp=oshop",  # Explicit shopping search pattern
         ]
         url_lower = url.lower()
         return any(p in url_lower for p in patterns)
@@ -795,11 +797,23 @@ class ExaClient:
         return None
 
     def _is_valid_retailer_url(self, url: str) -> bool:
-        """Check if a URL is a valid retailer product URL."""
+        """Check if a URL is a valid retailer product URL.
+
+        Uses config.NON_RETAILER_BLOCKLIST to reject non-retailer domains
+        and checks for common non-product URL patterns.
+        """
         if not url or not url.startswith("http"):
             return False
 
         url_lower = url.lower()
+
+        # Check blocklist for non-retailer domains (Instagram, Pinterest, blogs, etc.)
+        try:
+            from config import is_blocked_domain
+            if is_blocked_domain(url):
+                return False
+        except ImportError:
+            pass
 
         # Exclude Google URLs
         if "google.com" in url_lower:
@@ -808,12 +822,105 @@ class ExaClient:
         # Exclude common non-product URLs
         exclude_patterns = [
             "/search", "/results", "/browse", "/category",
-            "javascript:", "mailto:", "#"
+            "javascript:", "mailto:", "#",
+            # Blog/article patterns
+            "/blog/", "/article/", "/news/", "/stories/",
+            "/how-to/", "/guide/", "/tips/", "/ideas/",
+            "/inspiration/", "/tutorial/", "/diy/",
+            # Social patterns
+            "/post/", "/status/", "/reel/",
         ]
         if any(p in url_lower for p in exclude_patterns):
             return False
 
         return True
+
+    def validate_product_urls_batch(
+        self,
+        urls: List[str],
+        batch_size: int = 5,
+        max_chars: int = 2000
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        Batch validate URLs to ensure they are actual product pages.
+
+        Uses Exa get_contents() to fetch page content and checks for:
+        - Product page URL patterns (/product/, /p/, /dp/, etc.)
+        - Valid retailer URL (not Google redirect, not search/category)
+        - Shopping signals ($, add to cart, buy now, in stock)
+
+        Args:
+            urls: List of URLs to validate
+            batch_size: Number of URLs per Exa API call
+            max_chars: Maximum characters to fetch per URL
+
+        Returns:
+            Dict mapping URL -> {
+                "is_valid": bool,
+                "is_product_page": bool,
+                "has_shopping_signals": bool,
+                "error": str or None
+            }
+        """
+        results = {}
+
+        for i in range(0, len(urls), batch_size):
+            batch = urls[i:i + batch_size]
+
+            try:
+                contents = self.exa.get_contents(
+                    urls=batch,
+                    text={"max_characters": max_chars, "include_html_tags": True}
+                )
+
+                fetched_urls = set()
+                for content in (contents.results if contents else []):
+                    text = getattr(content, "text", "") or ""
+                    text_lower = text[:1500].lower()
+
+                    is_product = self._is_likely_product_page(content.url, text)
+                    is_valid_retailer = self._is_valid_retailer_url(content.url)
+                    has_shopping = any(
+                        tok in text_lower
+                        for tok in ["$", "add to cart", "add-to-cart", "in stock", "buy now", "add to bag"]
+                    )
+
+                    results[content.url] = {
+                        "is_valid": is_product and is_valid_retailer and has_shopping,
+                        "is_product_page": is_product,
+                        "is_valid_retailer": is_valid_retailer,
+                        "has_shopping_signals": has_shopping,
+                        "error": None
+                    }
+                    fetched_urls.add(content.url)
+
+                # Mark URLs that weren't fetched as errors
+                for url in batch:
+                    if url not in fetched_urls and url not in results:
+                        results[url] = {
+                            "is_valid": False,
+                            "is_product_page": False,
+                            "is_valid_retailer": False,
+                            "has_shopping_signals": False,
+                            "error": "fetch_failed"
+                        }
+
+            except Exception as e:
+                # Mark all URLs in failed batch as errors
+                for url in batch:
+                    if url not in results:
+                        results[url] = {
+                            "is_valid": False,
+                            "is_product_page": False,
+                            "is_valid_retailer": False,
+                            "has_shopping_signals": False,
+                            "error": str(e)
+                        }
+
+        valid_count = sum(1 for r in results.values() if r.get("is_valid"))
+        print(f"🔍 EXA Validation: {valid_count}/{len(urls)} URLs are valid product pages")
+
+        return results
 
     def resolve_urls_batch(
         self,

@@ -2,6 +2,7 @@
 
 import { ColorPaletteScreen } from "@/components/ColorPaletteScreen";
 import { GeneratedImageDisplay } from "@/components/GeneratedImageDisplay";
+import { ImprovementModeSelector } from "@/components/ImprovementModeSelector";
 import { PreferredStoresScreen } from "@/components/PreferredStoresScreen";
 import { StyleSelectionScreen } from "@/components/StyleSelectionScreen";
 import { ImageMarkerInterface } from "@/components/ImageMarkerInterface";
@@ -22,6 +23,7 @@ import {
   useGenerateMarkerRecommendations,
   useGenerateInspirationRecommendations,
   useGetProject,
+  useSetImprovementMode,
 } from "@/lib/api";
 import Link from "next/link";
 import { useState } from "react";
@@ -33,6 +35,7 @@ export default function ProjectPage() {
   const projectQuery = useGetProject(projectId);
   const generateMarkerRecs = useGenerateMarkerRecommendations();
   const generateInspirationRecs = useGenerateInspirationRecommendations();
+  const setImprovementMode = useSetImprovementMode();
 
   // Helper function to determine if we've reached or passed a certain status
   const hasReachedStatus = (targetStatus: string, currentStatus: string) => {
@@ -158,9 +161,26 @@ export default function ProjectPage() {
             context={project.context}
           />
 
-          {project.status === "BASE_IMAGE_UPLOADED" && (
-            <SpaceTypeSelection projectId={project.project_id} />
-          )}
+          {/* Show improvement mode selector after upload, before space type */}
+          {project.status === "BASE_IMAGE_UPLOADED" &&
+            !project.context.improvement_mode && (
+              <div className="mt-8 bg-white dark:bg-gray-800 rounded-lg shadow-lg p-6">
+                <ImprovementModeSelector
+                  onSelect={(mode) => {
+                    setImprovementMode.mutate({
+                      projectId: project.project_id,
+                      mode,
+                    });
+                  }}
+                />
+              </div>
+            )}
+
+          {/* Show space type selection after improvement mode is set */}
+          {project.status === "BASE_IMAGE_UPLOADED" &&
+            project.context.improvement_mode && (
+              <SpaceTypeSelection projectId={project.project_id} />
+            )}
 
           {project.status === "SPACE_TYPE_SELECTED" &&
             project.context.space_type && (
@@ -337,6 +357,7 @@ export default function ProjectPage() {
                   (project.context.inspiration_recommendations || []).length > 0
                 }
                 selectedTrendingProducts={project.context.selected_trending_products || []}
+                modelUsed={project.context.inspiration_model_used}
               />
             )}
 
@@ -364,6 +385,7 @@ export default function ProjectPage() {
                 generationPrompt={project.context.generation_prompt}
                 colorScheme={project.context.color_scheme}
                 designStyle={project.context.design_style}
+                modelUsed={project.context.generation_model_used}
               />
             )}
 

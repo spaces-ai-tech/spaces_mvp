@@ -59,6 +59,11 @@ class CacheManager:
     Provides separate caches for:
     - Product searches (SerpAPI, Exa) - 24 hour TTL
     - Furniture analysis (per image region) - 7 day TTL
+    - URL Normalizer caches:
+      - Redirect resolution - 1 day TTL
+      - Canonical extraction - 7 day TTL
+      - Validation result - 12 hour TTL
+      - Shopping candidates - 3 day TTL
     """
 
     def __init__(self, config: Optional[Dict] = None):
@@ -69,6 +74,10 @@ class CacheManager:
             config: Optional configuration dict with:
                 - product_search_ttl: TTL for product searches (default: 24 hours)
                 - furniture_analysis_ttl: TTL for furniture analysis (default: 7 days)
+                - url_redirect_ttl: TTL for URL redirect resolution (default: 1 day)
+                - url_canonical_ttl: TTL for canonical extraction (default: 7 days)
+                - url_validation_ttl: TTL for validation results (default: 12 hours)
+                - url_shopping_ttl: TTL for shopping candidates (default: 3 days)
                 - max_size: Maximum entries per cache (default: 1000)
                 - use_disk_cache: Whether to enable disk persistence (default: False)
                 - disk_cache_dir: Directory for disk cache (default: data/cache)
@@ -82,18 +91,33 @@ class CacheManager:
         self.use_disk_cache = self.config.get("use_disk_cache", False)
         self.disk_cache_dir = self.config.get("disk_cache_dir", "data/cache")
 
+        # URL Normalizer TTLs
+        self.url_redirect_ttl = self.config.get("url_redirect_ttl", 24 * 60 * 60)  # 1 day
+        self.url_canonical_ttl = self.config.get("url_canonical_ttl", 7 * 24 * 60 * 60)  # 7 days
+        self.url_validation_ttl = self.config.get("url_validation_ttl", 12 * 60 * 60)  # 12 hours
+        self.url_shopping_ttl = self.config.get("url_shopping_ttl", 3 * 24 * 60 * 60)  # 3 days
+
         # Initialize in-memory caches
         self._use_ttl_cache = False
         try:
             from cachetools import TTLCache
             self._product_cache = TTLCache(maxsize=self.max_size, ttl=self.product_search_ttl)
             self._furniture_cache = TTLCache(maxsize=self.max_size, ttl=self.furniture_analysis_ttl)
+            # URL Normalizer caches
+            self._url_redirect_cache = TTLCache(maxsize=self.max_size, ttl=self.url_redirect_ttl)
+            self._url_canonical_cache = TTLCache(maxsize=self.max_size, ttl=self.url_canonical_ttl)
+            self._url_validation_cache = TTLCache(maxsize=self.max_size, ttl=self.url_validation_ttl)
+            self._url_shopping_cache = TTLCache(maxsize=self.max_size, ttl=self.url_shopping_ttl)
             self._use_ttl_cache = True
             logger.info(f"Memory cache initialized with TTL (max_size={self.max_size})")
         except ImportError:
             logger.warning("cachetools not installed, using simple dict cache (no TTL)")
             self._product_cache = {}
             self._furniture_cache = {}
+            self._url_redirect_cache = {}
+            self._url_canonical_cache = {}
+            self._url_validation_cache = {}
+            self._url_shopping_cache = {}
 
         # Initialize disk cache if enabled
         self._disk_cache = None
@@ -245,6 +269,175 @@ class CacheManager:
 
         logger.debug(f"Cached furniture analysis for {bbox_key}")
 
+    # ==================== URL Normalizer Caching ====================
+
+    def get_redirect_resolution(self, url: str) -> Optional[Dict]:
+        """
+        Get cached redirect resolution for a URL.
+
+        Args:
+            url: Original URL
+
+        Returns:
+            Cached resolution dict if found, None otherwise
+        """
+        key = f"url_redirect:{_generate_cache_key(url)}"
+
+        with self._lock:
+            if key in self._url_redirect_cache:
+                cache_stats.record("url_redirect", hit=True)
+                return self._url_redirect_cache[key]
+
+            if self._disk_cache and key in self._disk_cache:
+                result = self._disk_cache[key]
+                self._url_redirect_cache[key] = result
+                cache_stats.record("url_redirect", hit=True)
+                return result
+
+        cache_stats.record("url_redirect", hit=False)
+        return None
+
+    def set_redirect_resolution(self, url: str, resolution: Dict):
+        """
+        Cache redirect resolution for a URL.
+
+        Args:
+            url: Original URL
+            resolution: Resolution dict to cache
+        """
+        key = f"url_redirect:{_generate_cache_key(url)}"
+
+        with self._lock:
+            self._url_redirect_cache[key] = resolution
+            if self._disk_cache:
+                self._disk_cache.set(key, resolution, expire=self.url_redirect_ttl)
+
+    def get_canonical_extraction(self, url: str) -> Optional[Dict]:
+        """
+        Get cached canonical extraction for a URL.
+
+        Args:
+            url: Final URL (after redirects)
+
+        Returns:
+            Cached canonical dict if found, None otherwise
+        """
+        key = f"url_canonical:{_generate_cache_key(url)}"
+
+        with self._lock:
+            if key in self._url_canonical_cache:
+                cache_stats.record("url_canonical", hit=True)
+                return self._url_canonical_cache[key]
+
+            if self._disk_cache and key in self._disk_cache:
+                result = self._disk_cache[key]
+                self._url_canonical_cache[key] = result
+                cache_stats.record("url_canonical", hit=True)
+                return result
+
+        cache_stats.record("url_canonical", hit=False)
+        return None
+
+    def set_canonical_extraction(self, url: str, canonical: Dict):
+        """
+        Cache canonical extraction for a URL.
+
+        Args:
+            url: Final URL (after redirects)
+            canonical: Canonical extraction dict to cache
+        """
+        key = f"url_canonical:{_generate_cache_key(url)}"
+
+        with self._lock:
+            self._url_canonical_cache[key] = canonical
+            if self._disk_cache:
+                self._disk_cache.set(key, canonical, expire=self.url_canonical_ttl)
+
+    def get_validation_result(self, url: str) -> Optional[Dict]:
+        """
+        Get cached validation result for a URL.
+
+        Args:
+            url: URL to check
+
+        Returns:
+            Cached validation dict if found, None otherwise
+        """
+        key = f"url_validation:{_generate_cache_key(url)}"
+
+        with self._lock:
+            if key in self._url_validation_cache:
+                cache_stats.record("url_validation", hit=True)
+                return self._url_validation_cache[key]
+
+            if self._disk_cache and key in self._disk_cache:
+                result = self._disk_cache[key]
+                self._url_validation_cache[key] = result
+                cache_stats.record("url_validation", hit=True)
+                return result
+
+        cache_stats.record("url_validation", hit=False)
+        return None
+
+    def set_validation_result(self, url: str, validation: Dict):
+        """
+        Cache validation result for a URL.
+
+        Args:
+            url: URL that was validated
+            validation: Validation result dict to cache
+        """
+        key = f"url_validation:{_generate_cache_key(url)}"
+
+        with self._lock:
+            self._url_validation_cache[key] = validation
+            if self._disk_cache:
+                self._disk_cache.set(key, validation, expire=self.url_validation_ttl)
+
+    def get_shopping_candidates(self, query: str) -> Optional[List[Dict]]:
+        """
+        Get cached Google Shopping candidates for a query.
+
+        Args:
+            query: Search query or Google Shopping URL
+
+        Returns:
+            Cached candidates list if found, None otherwise
+        """
+        key = f"url_shopping:{_generate_cache_key(query)}"
+
+        with self._lock:
+            if key in self._url_shopping_cache:
+                cache_stats.record("url_shopping", hit=True)
+                return self._url_shopping_cache[key]
+
+            if self._disk_cache and key in self._disk_cache:
+                result = self._disk_cache[key]
+                self._url_shopping_cache[key] = result
+                cache_stats.record("url_shopping", hit=True)
+                return result
+
+        cache_stats.record("url_shopping", hit=False)
+        return None
+
+    def set_shopping_candidates(self, query: str, candidates: List[Dict]):
+        """
+        Cache Google Shopping candidates for a query.
+
+        Args:
+            query: Search query or Google Shopping URL
+            candidates: List of candidate products to cache
+        """
+        if not candidates:
+            return  # Don't cache empty results
+
+        key = f"url_shopping:{_generate_cache_key(query)}"
+
+        with self._lock:
+            self._url_shopping_cache[key] = candidates
+            if self._disk_cache:
+                self._disk_cache.set(key, candidates, expire=self.url_shopping_ttl)
+
     # ==================== Cache Management ====================
 
     def clear_project_cache(self, project_id: str):
@@ -273,6 +466,10 @@ class CacheManager:
         with self._lock:
             self._product_cache.clear()
             self._furniture_cache.clear()
+            self._url_redirect_cache.clear()
+            self._url_canonical_cache.clear()
+            self._url_validation_cache.clear()
+            self._url_shopping_cache.clear()
             if self._disk_cache:
                 self._disk_cache.clear()
         logger.info("Cleared all caches")
@@ -282,6 +479,10 @@ class CacheManager:
         return {
             "memory_product_count": len(self._product_cache),
             "memory_furniture_count": len(self._furniture_cache),
+            "memory_url_redirect_count": len(self._url_redirect_cache),
+            "memory_url_canonical_count": len(self._url_canonical_cache),
+            "memory_url_validation_count": len(self._url_validation_cache),
+            "memory_url_shopping_count": len(self._url_shopping_cache),
             "disk_enabled": self._disk_cache is not None,
             "ttl_enabled": self._use_ttl_cache,
             "hit_miss_stats": cache_stats.get_stats()
@@ -296,4 +497,9 @@ cache_manager = CacheManager(config={
     "max_size": int(os.getenv("CACHE_MAX_SIZE", 1000)),
     "use_disk_cache": os.getenv("USE_DISK_CACHE", "false").lower() == "true",
     "disk_cache_dir": os.getenv("CACHE_DIR", "data/cache"),
+    # URL Normalizer cache TTLs
+    "url_redirect_ttl": int(os.getenv("CACHE_URL_REDIRECT_TTL", 24 * 60 * 60)),  # 1 day
+    "url_canonical_ttl": int(os.getenv("CACHE_URL_CANONICAL_TTL", 7 * 24 * 60 * 60)),  # 7 days
+    "url_validation_ttl": int(os.getenv("CACHE_URL_VALIDATION_TTL", 12 * 60 * 60)),  # 12 hours
+    "url_shopping_ttl": int(os.getenv("CACHE_URL_SHOPPING_TTL", 3 * 24 * 60 * 60)),  # 3 days
 })

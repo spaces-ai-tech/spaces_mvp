@@ -14,6 +14,7 @@ import requests
 from PIL import Image
 
 from cache_manager import cache_manager
+from config import is_valid_product
 
 load_dotenv()
 
@@ -54,17 +55,37 @@ class SerpClient:
         try:
             print(f"[SERP_API] Query: '{query}' (requesting {num_results} results)")
 
-            # Use Google Shopping search - simple and direct
-            search = GoogleSearch(
-                {
-                    "q": query,
-                    "tbm": "shop",
-                    "api_key": self.api_key,
-                    "num": min(num_results, 20),  # Increased from 10 for better coverage
-                    "hl": "en",
-                    "gl": "us",
-                }
-            )
+            # Import feature flag for API selection
+            from config import FeatureFlags
+
+            # Use google_shopping_light for direct retailer URLs (preferred)
+            # or fall back to legacy tbm=shop if flag is disabled
+            if FeatureFlags.USE_SHOPPING_LIGHT_API:
+                # google_shopping_light returns direct retailer URLs in 'link' field
+                search = GoogleSearch(
+                    {
+                        "engine": "google_shopping_light",
+                        "q": query,
+                        "api_key": self.api_key,
+                        "num": min(num_results, 20),
+                        "hl": "en",
+                        "gl": "us",
+                    }
+                )
+                print(f"[SERP_API] Using google_shopping_light engine for direct retailer URLs")
+            else:
+                # Legacy: tbm=shop returns Google Shopping redirect URLs
+                search = GoogleSearch(
+                    {
+                        "q": query,
+                        "tbm": "shop",
+                        "api_key": self.api_key,
+                        "num": min(num_results, 20),
+                        "hl": "en",
+                        "gl": "us",
+                    }
+                )
+                print(f"[SERP_API] Using legacy tbm=shop engine")
 
             result = search.get_dict()
 
@@ -158,6 +179,13 @@ class SerpClient:
                 for item in shopping_results
             ]
 
+            # Filter out plans, blueprints, PDFs - we need real furniture photos
+            original_count = len(results_list)
+            results_list = [r for r in results_list if is_valid_product(r.get("title", ""))]
+            filtered_count = original_count - len(results_list)
+            if filtered_count > 0:
+                print(f"🗑️ Filtered out {filtered_count} non-product items (plans/blueprints/PDFs)")
+
             # Cache successful results
             if results_list:
                 cache_manager.set_product_search("serp", query, num_results, results_list)
@@ -198,6 +226,93 @@ class SerpClient:
             key=lambda x: (x.get("rating") or 0, x.get("reviews") or 0), reverse=True
         )
         return products
+
+    def search_images(
+        self,
+        query: str,
+        num_results: int = 10,
+    ) -> List[Dict[str, Any]]:
+        """
+        Search Google Images for product images.
+
+        Used for the recommended products feature to get more/better product images
+        when Google Shopping returns limited results.
+
+        Args:
+            query: Search query (e.g., "modern bed frame")
+            num_results: Number of results to return (max 20)
+
+        Returns:
+            List of image results with: original URL, thumbnail, title, source
+        """
+        # Check cache first
+        cache_key = f"images_{query}_{num_results}"
+        cached = cache_manager.get_product_search("serp_images", query, num_results)
+        if cached is not None:
+            print(f"[SERP_IMAGES] 💾 Cache HIT for query: '{query[:40]}...'")
+            return cached
+
+        try:
+            print(f"[SERP_IMAGES] Query: '{query}' (requesting {num_results} results)")
+
+            search = GoogleSearch({
+                "q": query,
+                "tbm": "isch",  # Image search
+                "api_key": self.api_key,
+                "num": min(num_results, 20),
+                "hl": "en",
+                "gl": "us",
+            })
+
+            result = search.get_dict()
+
+            # Check for API errors
+            if "error" in result:
+                print(f"[SERP_IMAGES] ERROR: {result['error']}")
+                return []
+
+            images_results = result.get("images_results", [])
+            print(f"[SERP_IMAGES] Raw results count: {len(images_results)}")
+
+            results = []
+            for item in images_results:
+                source = item.get("source", "")
+
+                # Filter out non-retailer sources
+                source_lower = source.lower() if source else ""
+                blocked_sources = [
+                    "pinterest", "instagram", "youtube", "tiktok",
+                    "flickr", "tumblr", "reddit", "twitter", "x.com",
+                    "shutterstock", "istockphoto", "gettyimages", "alamy",
+                    "stock", "depositphotos", "dreamstime", "123rf",
+                    "medium.com", "wordpress", "blogspot", "wixsite",
+                ]
+
+                if any(blocked in source_lower for blocked in blocked_sources):
+                    continue
+
+                results.append({
+                    "title": item.get("title", ""),
+                    "url": item.get("link", ""),  # Source page URL
+                    "image_url": item.get("original", ""),  # Full-size image
+                    "thumbnail": item.get("thumbnail", ""),
+                    "source": source,  # Domain name
+                    "position": item.get("position", 0),
+                })
+
+            print(f"[SERP_IMAGES] Filtered results: {len(results)} (removed {len(images_results) - len(results)} non-retailer)")
+
+            # Cache successful results
+            if results:
+                cache_manager.set_product_search("serp_images", query, num_results, results)
+
+            return results
+
+        except Exception as e:
+            print(f"[SERP_IMAGES] Error searching images: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
 
     def search_and_analyze_products(
         self, query: str, space_type: str, num_results: int = 15
@@ -495,6 +610,63 @@ class SerpClient:
 
         return {"products": final_products, "meta": meta}
 
+    # --- Google Shopping URL detection ---
+    def _is_google_shopping_url(self, url: str) -> bool:
+        """Check if URL is a Google Shopping redirect or intermediate page.
+
+        Google Lens sometimes returns Google Shopping URLs instead of direct
+        retailer URLs. These should be filtered out in favor of direct links.
+
+        Args:
+            url: URL to check
+
+        Returns:
+            True if URL is a Google Shopping URL that should be filtered
+        """
+        if not url:
+            return False
+        url_lower = url.lower()
+        return any(pattern in url_lower for pattern in [
+            "google.com/shopping",
+            "google.com/url?",
+            "google.com/aclk",
+            "shopping.google.com",
+            "google.com/search",
+        ])
+
+    def _is_blocked_non_retailer(self, url: str, title: str = "") -> bool:
+        """Check if URL or title indicates a non-retailer result.
+
+        Two-tier filtering:
+        1. Check title for DIY/plan/tutorial patterns (fast rejection)
+        2. Check domain against non-retailer blocklist
+
+        Args:
+            url: URL to check
+            title: Optional title to check for non-product patterns
+
+        Returns:
+            True if result should be blocked (not from a retailer)
+        """
+        from config import is_blocked_domain, is_non_product_title
+
+        # Tier 1: Check title first (fastest rejection)
+        if title and is_non_product_title(title):
+            return True
+
+        # Tier 2: Check domain blocklist
+        if not url:
+            return True
+
+        if is_blocked_domain(url):
+            return True
+
+        # Also catch any google.com URLs not caught by _is_google_shopping_url
+        if "google.com" in url.lower():
+            return True
+
+        return False
+
     # --- Google Lens reverse image search support ---
     def reverse_image_search_google_lens(self, image_path: str) -> List[Dict[str, Any]]:
         """Perform Google Lens reverse image search via SerpAPI.
@@ -549,6 +721,8 @@ class SerpClient:
     def reverse_image_search_google_lens_url(self, image_url: str) -> List[Dict[str, Any]]:
         """Enhanced Google Lens search using all result types for better matching.
 
+        Filters out Google Shopping URLs to return only direct retailer links.
+
         Args:
             image_url: Publicly accessible image URL
 
@@ -566,17 +740,65 @@ class SerpClient:
 
             matches: List[Dict[str, Any]] = []
             seen_urls = set()
+            filtered_counts = {
+                "google_shopping": 0,
+                "non_retailer": 0,
+                "non_product_title": 0,
+            }
+
+            def _extract_best_url(match_data: Dict[str, Any]) -> Optional[str]:
+                """Extract the best direct retailer URL from a match.
+
+                Two-tier filtering:
+                1. First check title for non-product patterns (DIY plans, tutorials, etc.)
+                2. Then filter Google Shopping URLs and non-retailer domains
+
+                Returns None if result should be blocked.
+                """
+                nonlocal filtered_counts
+
+                title = match_data.get("title", "")
+                product_link = match_data.get("product_link", "")
+                link = match_data.get("link", "")
+
+                # Tier 1: Check title first (fastest rejection)
+                from config import is_non_product_title
+                if title and is_non_product_title(title):
+                    filtered_counts["non_product_title"] += 1
+                    print(f"[LENS] Filtered non-product title: '{title[:50]}...'")
+                    return None
+
+                # Tier 2: Check URLs
+                for candidate in [product_link, link]:
+                    if not candidate:
+                        continue
+
+                    # Filter Google Shopping URLs
+                    if self._is_google_shopping_url(candidate):
+                        filtered_counts["google_shopping"] += 1
+                        continue
+
+                    # Filter non-retailer domains (Instagram, Pinterest, blogs, etc.)
+                    if self._is_blocked_non_retailer(candidate, title):
+                        filtered_counts["non_retailer"] += 1
+                        print(f"[LENS] Filtered non-retailer: {candidate[:60]}...")
+                        continue
+
+                    # This candidate passed all filters
+                    return candidate
+
+                return None
 
             # Priority 1: exact_matches (identical/near-identical products - highest value)
             exact_count = 0
             for m in result.get("exact_matches", []) or []:
-                url = m.get("link", "")
+                url = _extract_best_url(m)
                 if url and url not in seen_urls:
                     seen_urls.add(url)
                     matches.append({
                         "title": m.get("title"),
                         "link": url,
-                        "product_link": m.get("product_link") or url,
+                        "product_link": url,
                         "source": m.get("source"),
                         "thumbnail": m.get("thumbnail"),
                         "price": m.get("price"),
@@ -589,13 +811,13 @@ class SerpClient:
             # Priority 2: visual_matches (visually similar products)
             visual_count = 0
             for m in result.get("visual_matches", []) or []:
-                url = m.get("link", "")
+                url = _extract_best_url(m)
                 if url and url not in seen_urls:
                     seen_urls.add(url)
                     matches.append({
                         "title": m.get("title"),
                         "link": url,
-                        "product_link": m.get("product_link") or url,
+                        "product_link": url,
                         "source": m.get("source"),
                         "thumbnail": m.get("thumbnail"),
                         "price": m.get("price"),
@@ -609,7 +831,7 @@ class SerpClient:
             kg = result.get("knowledge_graph", {})
             kg_count = 0
             for item in kg.get("products", []) or []:
-                url = item.get("link", "")
+                url = _extract_best_url(item)
                 if url and url not in seen_urls:
                     seen_urls.add(url)
                     matches.append({
@@ -628,7 +850,7 @@ class SerpClient:
             # Fallback to inline_images if no other matches found
             if not matches:
                 for m in result.get("inline_images", [])[:10]:
-                    url = m.get("link", "")
+                    url = _extract_best_url(m)
                     if url and url not in seen_urls:
                         seen_urls.add(url)
                         matches.append({
@@ -639,41 +861,50 @@ class SerpClient:
                             "match_type": "inline",
                         })
 
-            print(f"[LENS] Total matches: {len(matches)}")
+            # Log filtering summary
+            total_filtered = sum(filtered_counts.values())
+            if total_filtered > 0:
+                print(f"[LENS] Filtered: {filtered_counts['google_shopping']} Google Shopping, "
+                      f"{filtered_counts['non_retailer']} non-retailer domains, "
+                      f"{filtered_counts['non_product_title']} non-product titles")
+
+            print(f"[LENS] Total matches: {len(matches)} (filtered {total_filtered})")
             return matches
         except Exception as e:
             print(f"Error in reverse_image_search_google_lens_url: {e}")
             return []
 
     def _extract_retailer_url(self, shopping_result: Dict[str, Any]) -> str:
-        """Extract the direct retailer URL instead of Google Shopping intermediate page"""
+        """Extract the direct retailer URL instead of Google Shopping intermediate page.
 
-        # Check for direct retailer link in extensions (preferred)
-        extensions = shopping_result.get("extensions", [])
-        for ext in extensions:
-            if isinstance(ext, str) and ("Shop at" in ext or "Buy from" in ext):
-                # Sometimes extensions contain direct retailer links
-                continue
+        Priority order:
+        1. 'link' field - google_shopping_light provides direct retailer URLs here
+        2. 'product_link' field - may be direct or Google Shopping redirect
+        3. Fallback to empty string if nothing found
 
-        # Try the 'link' field first (direct retailer link)
+        This method filters out Google Shopping URLs to ensure users get actual
+        retailer links they can click and purchase from.
+        """
+        # Priority 1: 'link' field (google_shopping_light primary field with direct retailer URLs)
         direct_link = shopping_result.get("link")
-        if direct_link and not direct_link.startswith(
-            "https://www.google.com/shopping"
-        ):
+        if direct_link and not self._is_google_shopping_url(direct_link):
             return direct_link
 
-        # Fall back to product_link (Google Shopping page)
+        # Priority 2: 'product_link' field - check if it's a direct retailer URL
         product_link = shopping_result.get("product_link", "")
+        if product_link and not self._is_google_shopping_url(product_link):
+            return product_link
 
-        # If we only have Google Shopping link, try to construct direct retailer URL
-        # This is a fallback - the user will still get working links to Google Shopping
-        source = shopping_result.get("source", "").lower()
-        if product_link and source:
-            print(
-                f"⚠️ Using Google Shopping link for {source} - may redirect to retailer"
-            )
+        # Priority 3: If product_link is a Google Shopping URL, log warning but still return it
+        # (better than nothing - user can at least see product on Google Shopping)
+        source = shopping_result.get("source", "unknown")
+        if product_link:
+            print(f"⚠️ [SERP] Only Google Shopping URL available for {source}: {product_link[:60]}...")
+            return product_link
 
-        return product_link
+        # No URL found
+        print(f"❌ [SERP] No URL found for product from {source}")
+        return ""
 
     def _extract_product_info(
         self, search_result: Dict[str, Any]
@@ -790,3 +1021,487 @@ class SerpClient:
             pass
 
         return None
+
+    def _is_pdp_url(self, url: str) -> bool:
+        """
+        Check if URL is a Product Detail Page (PDP), not a search/category page.
+
+        Args:
+            url: URL to validate
+
+        Returns:
+            True if URL appears to be a PDP, False if it's a search/category page
+        """
+        url_lower = url.lower()
+
+        # Reject patterns (search/category pages)
+        reject_patterns = [
+            "/s?",           # Amazon search
+            "/s/",           # Target search
+            "/keyword.php",  # Wayfair search
+            "/search",       # Generic search
+            "/browse/",      # Category browse
+            "/collections/", # Shopify collections
+            "/c/",           # Category shorthand
+            "?q=",           # Query parameter
+            "?k=",           # Keyword parameter
+            "/filters/",     # Wayfair filters
+            "/sb0/",         # Wayfair browse
+            "/sb1/",         # Wayfair browse
+            "/sb2/",         # Wayfair browse
+        ]
+
+        if any(pattern in url_lower for pattern in reject_patterns):
+            return False
+
+        # Accept patterns (PDP indicators)
+        accept_patterns = [
+            "/dp/",          # Amazon
+            "/gp/product/",  # Amazon alternate
+            "/ip/",          # Walmart
+            "/p/",           # Target, generic
+            "/pd/",          # Wayfair
+            "/pdp/",         # Wayfair alternate
+            "/product/",     # Generic
+            "/-/A-",         # Target PDP
+            "/item/",        # Overstock, generic
+            "sku=",          # SKU parameter
+            "/products/",    # Generic
+        ]
+
+        # If URL has a PDP pattern, accept it
+        if any(pattern in url_lower for pattern in accept_patterns):
+            return True
+
+        # Default: reject if we can't confirm it's a PDP
+        # (conservative - better to miss than return search pages)
+        return False
+
+    def _fallback_site_search(self, query: str, domain: str) -> Optional[Dict[str, Any]]:
+        """
+        Fallback: Use site-specific search to find a PDP if Product API fails.
+
+        Args:
+            query: Product search query
+            domain: Retailer domain to search
+
+        Returns:
+            Product dict with PDP URL, or None if not found
+        """
+        try:
+            # Use exact match query for better results
+            search = GoogleSearch({
+                "q": f'"{query}" site:{domain}',
+                "api_key": self.api_key,
+                "num": 5,
+                "hl": "en",
+                "gl": "us",
+            })
+            result = search.get_dict()
+
+            for item in result.get("organic_results", []):
+                link = item.get("link", "")
+                if link and self._is_pdp_url(link):
+                    store_name = domain.replace(".com", "").title()
+                    print(f"[SERP] ✅ Fallback found {store_name} PDP: {link[:70]}...")
+                    return {
+                        "url": link,
+                        "title": item.get("title", ""),
+                        "store": store_name,
+                        "price_str": "",
+                        "thumbnail": item.get("thumbnail", ""),
+                        "source_api": "serp_fallback_site_search",
+                    }
+
+        except Exception as e:
+            print(f"[SERP] Fallback site search failed for {domain}: {e}")
+
+        return None
+
+    def resolve_google_shopping_url(
+        self,
+        google_url: str,
+        max_products: int = 3,
+        expected_retailer: Optional[str] = None,
+        expected_domain: Optional[str] = None,
+        strict_mode: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """
+        Resolve a Google Shopping URL to actual retailer PDP links.
+
+        RETAILER-PRESERVING RESOLUTION:
+        When expected_retailer is provided (e.g., "Quince"), we prioritize
+        returning PDPs from that specific retailer, NOT marketplace alternatives.
+
+        Resolution Priority:
+        1. Try product_link from shopping result (often already retailer's link)
+        2. Filter sellers by expected retailer domain
+        3. Use scoring system to pick best candidate
+        4. Fallback to site-specific search on expected retailer's domain
+        5. If strict_mode=True and no retailer match, return failure (not Walmart/Target)
+
+        Args:
+            google_url: Google Shopping search URL
+            max_products: Maximum number of PDPs to return (default: 3)
+            expected_retailer: Expected retailer name from "source" field (e.g., "Quince")
+            expected_domain: Expected retailer domain (e.g., "quince.com")
+            strict_mode: If True, fail instead of returning wrong retailer
+
+        Returns:
+            List of product dicts with retailer PDP URLs
+        """
+        from urllib.parse import urlparse, parse_qs, unquote
+
+        # Import retailer identity service for scoring
+        try:
+            from retailer_identity import retailer_identity_service
+        except ImportError:
+            retailer_identity_service = None
+            print("[SERP] ⚠️ RetailerIdentityService not available, using basic resolution")
+
+        try:
+            # Extract query from Google Shopping URL
+            parsed = urlparse(google_url)
+            params = parse_qs(parsed.query)
+
+            # Get the search query
+            query = params.get("q", [""])[0]
+            if not query:
+                print(f"[SERP] Could not extract query from Google Shopping URL")
+                return []
+
+            query = unquote(query)
+            print(f"[SERP] Resolving Google Shopping URL with query: '{query}'")
+            if expected_retailer:
+                print(f"[SERP] 🎯 Expected retailer: '{expected_retailer}'")
+
+            # Resolve expected_domain from expected_retailer if not provided
+            if expected_retailer and not expected_domain and retailer_identity_service:
+                expected_domain = retailer_identity_service.resolve_brand_to_domain(expected_retailer)
+                if expected_domain:
+                    print(f"[SERP] 🎯 Resolved expected domain: '{expected_domain}'")
+
+            # Step 1: Search Google Shopping via SerpAPI to get product_ids
+            search = GoogleSearch({
+                "q": query,
+                "tbm": "shop",
+                "api_key": self.api_key,
+                "num": 20,  # Fetch more to have fallback options
+                "hl": "en",
+                "gl": "us",
+            })
+
+            result = search.get_dict()
+            shopping_results = result.get("shopping_results", [])
+
+            print(f"[SERP] Shopping results count: {len(shopping_results)}")
+
+            # Step 2: Extract products with product_ids, prioritizing expected retailer
+            products_to_resolve = []
+            for item in shopping_results[:max_products * 5]:  # Extra for fallbacks
+                product_id = item.get("product_id")
+                source = item.get("source", "")
+                product_link = item.get("product_link", "")
+
+                if product_id:
+                    product_data = {
+                        "product_id": product_id,
+                        "title": item.get("title", ""),
+                        "price": item.get("extracted_price"),
+                        "source": source,
+                        "thumbnail": item.get("thumbnail", ""),
+                        "product_link": product_link,
+                        "link": item.get("link", ""),  # Sometimes has direct link
+                    }
+
+                    # Prioritize products from expected retailer
+                    if expected_retailer and retailer_identity_service:
+                        if retailer_identity_service.domain_matches_brand(source, expected_retailer):
+                            products_to_resolve.insert(0, product_data)
+                            print(f"[SERP] ⭐ Prioritized product from '{source}' (matches expected)")
+                        else:
+                            products_to_resolve.append(product_data)
+                    else:
+                        products_to_resolve.append(product_data)
+
+            print(f"[SERP] Found {len(products_to_resolve)} products with product_ids")
+
+            # Step 3: Resolve each product to retailer PDP
+            resolved_pdps = []
+            seen_domains = set()
+
+            for product in products_to_resolve:
+                if len(resolved_pdps) >= max_products:
+                    break
+
+                resolved = self._resolve_product_to_retailer_pdp(
+                    product=product,
+                    expected_retailer=expected_retailer,
+                    expected_domain=expected_domain,
+                    retailer_identity_service=retailer_identity_service,
+                    seen_domains=seen_domains,
+                    strict_mode=strict_mode,
+                )
+
+                if resolved:
+                    resolved_pdps.append(resolved)
+
+            # Step 4: Fallback - site-specific search on expected retailer's domain
+            if len(resolved_pdps) < max_products and expected_domain:
+                print(f"[SERP] Trying fallback site search on {expected_domain}...")
+                fallback_result = self._fallback_site_search(query, expected_domain)
+                if fallback_result:
+                    resolved_pdps.append(fallback_result)
+                    print(f"[SERP] ✅ Fallback found PDP on {expected_domain}")
+
+            # Step 5: If strict_mode=False and still no results, try any retailer
+            if not strict_mode and len(resolved_pdps) < max_products:
+                print(f"[SERP] Non-strict mode: trying any retailer as fallback...")
+                fallback_domains = ["wayfair.com", "amazon.com", "target.com", "walmart.com"]
+
+                for domain in fallback_domains:
+                    if len(resolved_pdps) >= max_products:
+                        break
+
+                    domain_base = domain.replace(".com", "")
+                    if domain_base.lower() in [d.replace(".com", "").lower() for d in seen_domains]:
+                        continue
+
+                    fallback_result = self._fallback_site_search(query, domain)
+                    if fallback_result:
+                        resolved_pdps.append(fallback_result)
+                        seen_domains.add(domain)
+
+            print(f"[SERP] Resolved to {len(resolved_pdps)} retailer PDPs")
+            return resolved_pdps
+
+        except Exception as e:
+            print(f"[SERP] Error resolving Google Shopping URL: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
+
+    def _resolve_product_to_retailer_pdp(
+        self,
+        product: Dict[str, Any],
+        expected_retailer: Optional[str],
+        expected_domain: Optional[str],
+        retailer_identity_service,
+        seen_domains: set,
+        strict_mode: bool,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Resolve a single product to its retailer PDP using scoring.
+
+        Priority:
+        1. product_link / link from shopping result (often direct retailer link)
+        2. Seller links filtered by expected retailer
+        3. Best scoring candidate from all sellers
+        """
+        from urllib.parse import urlparse
+
+        product_title = product.get("title", "")
+        product_source = product.get("source", "")
+
+        # === LAYER 1: Try direct links from shopping result ===
+        direct_links = [
+            product.get("product_link"),
+            product.get("link"),
+        ]
+
+        for link in direct_links:
+            if not link or "google.com" in link.lower():
+                continue
+
+            # Follow redirects to get final URL
+            final_url = self._follow_redirect_chain(link)
+            if not final_url:
+                continue
+
+            try:
+                domain = urlparse(final_url).netloc.lower().replace("www.", "")
+            except Exception:
+                continue
+
+            if domain in seen_domains:
+                continue
+
+            # Score this candidate
+            if retailer_identity_service:
+                score = retailer_identity_service.score_candidate_url(
+                    url=final_url,
+                    expected_retailer=expected_retailer,
+                    expected_domain=expected_domain,
+                    product_title=product_title,
+                )
+
+                # If matches expected retailer, use it
+                if score >= 100:  # Domain match threshold
+                    seen_domains.add(domain)
+                    print(f"[SERP] ✅ Direct link matched retailer: {final_url[:70]}... (score={score})")
+                    return self._build_pdp_result(
+                        url=final_url,
+                        product=product,
+                        domain=domain,
+                        source_api="direct_link",
+                    )
+            elif self._is_pdp_url(final_url):
+                # No identity service, accept valid PDPs
+                seen_domains.add(domain)
+                return self._build_pdp_result(
+                    url=final_url,
+                    product=product,
+                    domain=domain,
+                    source_api="direct_link",
+                )
+
+        # === LAYER 2: Try Google Product API sellers ===
+        try:
+            product_search = GoogleSearch({
+                "engine": "google_product",
+                "product_id": product["product_id"],
+                "api_key": self.api_key,
+                "hl": "en",
+                "gl": "us",
+            })
+            product_result = product_search.get_dict()
+
+            sellers_data = product_result.get("sellers_results", {})
+            online_sellers = sellers_data.get("online_sellers", [])
+
+            print(f"[SERP] Product '{product_title[:40]}...' has {len(online_sellers)} sellers")
+
+            if not online_sellers:
+                return None
+
+            # Build candidate list with scores
+            candidates = []
+            for seller in online_sellers:
+                link = seller.get("link", "")
+                if not link or "google.com" in link.lower():
+                    continue
+
+                # Follow redirects
+                final_url = self._follow_redirect_chain(link) or link
+
+                try:
+                    domain = urlparse(final_url).netloc.lower().replace("www.", "")
+                except Exception:
+                    continue
+
+                if domain in seen_domains:
+                    continue
+
+                if not self._is_pdp_url(final_url):
+                    continue
+
+                # Score candidate
+                score = 0
+                if retailer_identity_service:
+                    score = retailer_identity_service.score_candidate_url(
+                        url=final_url,
+                        expected_retailer=expected_retailer,
+                        expected_domain=expected_domain,
+                        product_title=product_title,
+                    )
+
+                candidates.append({
+                    "url": final_url,
+                    "domain": domain,
+                    "seller_name": seller.get("name", ""),
+                    "price": seller.get("price", "") or seller.get("total_price", ""),
+                    "score": score,
+                })
+
+            if not candidates:
+                return None
+
+            # Sort by score (highest first)
+            candidates.sort(key=lambda x: x["score"], reverse=True)
+
+            # Log candidate scores for debugging
+            print(f"[SERP] Candidate scores:")
+            for c in candidates[:5]:
+                print(f"  - {c['domain']}: score={c['score']}")
+
+            best = candidates[0]
+
+            # In strict mode, only accept if score indicates retailer match
+            if strict_mode and expected_retailer:
+                if best["score"] < 50:  # Below PDP threshold
+                    print(f"[SERP] ⚠️ Strict mode: Best candidate score too low ({best['score']})")
+                    return None
+                if best["score"] < 100 and retailer_identity_service:
+                    # Didn't match expected retailer
+                    if retailer_identity_service.is_marketplace(best["domain"]):
+                        print(f"[SERP] ⚠️ Strict mode: Best candidate is marketplace, not {expected_retailer}")
+                        return None
+
+            seen_domains.add(best["domain"])
+            print(f"[SERP] ✅ Selected {best['seller_name'] or best['domain']}: {best['url'][:70]}... (score={best['score']})")
+
+            return self._build_pdp_result(
+                url=best["url"],
+                product=product,
+                domain=best["domain"],
+                source_api="google_product_api",
+                price_str=best.get("price", ""),
+            )
+
+        except Exception as e:
+            print(f"[SERP] Product API failed for {product['product_id']}: {e}")
+            return None
+
+    def _build_pdp_result(
+        self,
+        url: str,
+        product: Dict[str, Any],
+        domain: str,
+        source_api: str,
+        price_str: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Build a standardized PDP result dict."""
+        store_name = domain.replace(".com", "").replace("www.", "").title()
+
+        return {
+            "url": url,
+            "title": product.get("title", ""),
+            "store": store_name,
+            "price_str": price_str or "",
+            "thumbnail": product.get("thumbnail", ""),
+            "source_api": source_api,
+            "product_id": product.get("product_id", ""),
+            "original_source": product.get("source", ""),  # Original retailer from shopping result
+        }
+
+    def _follow_redirect_chain(self, url: str, max_redirects: int = 5) -> Optional[str]:
+        """Follow redirect chain to get final URL."""
+        try:
+            import requests
+
+            response = requests.head(
+                url,
+                allow_redirects=True,
+                timeout=5,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; FurnitureBot/1.0)"}
+            )
+
+            if response.status_code == 200:
+                return response.url
+
+            # Try GET if HEAD fails
+            response = requests.get(
+                url,
+                allow_redirects=True,
+                timeout=5,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; FurnitureBot/1.0)"}
+            )
+
+            if response.status_code == 200:
+                return response.url
+
+            return None
+
+        except Exception as e:
+            print(f"[SERP] Redirect chain failed for {url[:50]}...: {e}")
+            return None

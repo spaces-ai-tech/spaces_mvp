@@ -13,8 +13,11 @@ from models import (
     ImageUploadResponse,
     ImprovementMarkersRequest,
     ImprovementMarkersResponse,
+    ImprovementModeRequest,
+    ImprovementModeResponse,
     MarkerRecommendationsResponse,
     InspirationImageGenerationResponse,
+    RetryRedesignRequest,
     InspirationImagesBatchUploadResponse,
     InspirationImageUploadResponse,
     InspirationRecommendationsResponse,
@@ -43,6 +46,7 @@ from models import (
     AffiliateCartRequest,
     AffiliateCartResponse,
     AffiliateProduct,
+    AffiliateProductItem,
     RetailerCart,
     ApplyColorRequest,
     ApplyColorResponse,
@@ -73,6 +77,8 @@ from models import (
     ResolvedProduct,
     ProcessFurnitureSelectionRequest,
     ProcessFurnitureSelectionResponse,
+    # URL Normalizer Models
+    NormalizeURLsRequest,
 )
 
 load_dotenv()
@@ -243,6 +249,24 @@ async def select_project_space_type(
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"Failed to select space type: {str(e)}"
+        )
+
+
+@app.post("/projects/{project_id}/improvement-mode", response_model=ImprovementModeResponse)
+async def set_improvement_mode(project_id: str, request: ImprovementModeRequest):
+    """Set the improvement mode for a project (iterative or complete_revamp)"""
+    try:
+        mode = data_manager.set_improvement_mode(project_id, request.mode)
+        project = data_manager.get_project(project_id)
+
+        return ImprovementModeResponse(
+            project_id=project_id, mode=mode, status=project["status"]
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to set improvement mode: {str(e)}"
         )
 
 
@@ -520,6 +544,7 @@ async def generate_inspiration_redesign(project_id: str):
             inspiration_recommendations=result["inspiration_recommendations"],
             status=result["status"],
             message=result["message"],
+            model_used=result.get("model_used"),
         )
     except ValueError as e:
         logger.error(
@@ -540,6 +565,87 @@ async def generate_inspiration_redesign(project_id: str):
         raise HTTPException(
             status_code=500,
             detail=f"Failed to generate inspiration redesign: {str(e)}",
+        )
+
+
+@app.post(
+    "/projects/{project_id}/retry-redesign",
+    response_model=InspirationImageGenerationResponse,
+)
+async def retry_redesign(project_id: str, request: RetryRedesignRequest):
+    """
+    Apply user-directed modifications to the existing generated image.
+
+    This is a SURGICAL EDIT operation - takes the last generated image
+    and applies only the specific changes the user requested.
+
+    Examples:
+        - "remove the lamp on the nightstand"
+        - "add a plant in the corner"
+        - "replace the blue sofa with a grey one"
+    """
+    logger.info(
+        "API request: retry redesign",
+        extra={"project_id": project_id, "feedback": request.feedback[:100]},
+    )
+    project = data_manager.get_project(project_id)
+
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    # Check if project has a generated image to edit
+    context = ProjectContext.model_validate(project["context"])
+    if not context.inspiration_generated_image_base64:
+        raise HTTPException(
+            status_code=400,
+            detail="No generated image available to edit. Please generate an image first.",
+        )
+
+    try:
+        logger.info(
+            "Starting retry redesign",
+            extra={
+                "project_id": project_id,
+                "feedback": request.feedback[:100],
+            },
+        )
+        result = data_manager.retry_inspiration_redesign(project_id, request.feedback)
+
+        logger.info(
+            "Retry redesign completed successfully",
+            extra={
+                "project_id": project_id,
+                "image_len": len(result.get("generated_image_base64", "")),
+            },
+        )
+        return InspirationImageGenerationResponse(
+            project_id=project_id,
+            generated_image_base64=result["generated_image_base64"],
+            inspiration_prompt=result["inspiration_prompt"],
+            inspiration_recommendations=result["inspiration_recommendations"],
+            status=result["status"],
+            message=result["message"],
+            model_used=result.get("model_used"),
+        )
+    except ValueError as e:
+        logger.error(
+            "Retry redesign failed: ValueError",
+            extra={"project_id": project_id, "error": str(e)},
+        )
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        import traceback
+        logger.error(
+            "Retry redesign failed: Unexpected error",
+            extra={
+                "project_id": project_id,
+                "error": str(e),
+                "trace": traceback.format_exc(),
+            },
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to edit image: {str(e)}",
         )
 
 
@@ -1418,6 +1524,7 @@ async def generate_product_visualization(project_id: str):
             generation_prompt=generation_result["generation_prompt"],
             status="success",
             message=generation_result["message"],
+            model_used=generation_result.get("model_used"),
         )
 
     except Exception as e:
@@ -1640,98 +1747,239 @@ async def replicate_segment(project_id: str, image_type: str = "product", image_
 @app.post("/affiliate/generate-cart", response_model=AffiliateCartResponse)
 async def generate_affiliate_cart(request: AffiliateCartRequest):
     """
-    Generate affiliate cart from product URLs.
-    Resolves Google Shopping links, validates URLs, groups by retailer, creates cart URLs.
+    Generate affiliate cart from product URLs with RETAILER-PRESERVING resolution.
+
+    KEY BEHAVIOR:
+    - When user selects a "Quince" product, we return quince.com PDP (not Walmart/Target)
+    - Uses retailer identity scoring to select best candidate
+    - In strict_mode (default), fails instead of returning wrong retailer
+
+    API Options:
+    1. NEW (recommended): Use 'items' with retailer_hint for retailer-preserving resolution
+    2. LEGACY: Use 'product_urls' for backward compatibility (non-strict resolution)
     """
-    original_urls = request.product_urls
-    logger.info(f"API request: generate affiliate cart for {len(original_urls)} URLs")
+    from urllib.parse import urlparse
 
     try:
         from affiliate_client import AffiliateClient
-        from exa_client import ExaClient
+        from serp_client import SerpClient
 
         affiliate_client = AffiliateClient()
+        serp_client = None
 
-        # ============================================================
-        # STEP 1: Resolve Google Shopping URLs to retailer pages
-        # ============================================================
-        resolved_urls = []
-        resolution_stats = {"google_shopping_count": 0, "resolved_count": 0}
-
+        # Try to load retailer identity service
         try:
-            exa_client = ExaClient()
-            logger.info(f"Resolving {len(original_urls)} URLs (checking for Google Shopping links)...")
+            from retailer_identity import retailer_identity_service
+        except ImportError:
+            retailer_identity_service = None
+            logger.warning("[AFFILIATE] RetailerIdentityService not available")
 
-            url_resolutions = exa_client.resolve_urls_batch(original_urls, resolve_google_shopping=True)
+        # ============================================================
+        # Determine input mode: new 'items' API vs legacy 'product_urls'
+        # ============================================================
+        use_items_api = request.items and len(request.items) > 0
+        strict_mode = request.strict_mode
 
-            for url in original_urls:
-                resolution = url_resolutions.get(url, {})
-                resolved_url = resolution.get("resolved_url", url)
-                resolved_urls.append(resolved_url)
+        if use_items_api:
+            items = request.items
+            logger.info(f"[AFFILIATE] Using items API with {len(items)} items (strict_mode={strict_mode})")
+        else:
+            # Legacy mode: convert product_urls to items without retailer hints
+            product_urls = request.product_urls or []
+            items = [
+                type('obj', (object,), {
+                    'shopping_url': url,
+                    'retailer_hint': None,
+                    'expected_domain': None,
+                    'title': None,
+                })()
+                for url in product_urls
+            ]
+            # Legacy mode uses non-strict by default
+            strict_mode = False
+            logger.info(f"[AFFILIATE] Using legacy product_urls API with {len(items)} URLs (strict_mode=False)")
 
-                if resolution.get("is_google_shopping", False):
-                    resolution_stats["google_shopping_count"] += 1
-                    if resolution.get("resolution_success", False):
+        # ============================================================
+        # STEP 1: Resolve URLs with retailer-preserving logic
+        # ============================================================
+        resolved_products = []  # List of {original_url, resolved_url, expected_retailer, actual_retailer, ...}
+        resolution_stats = {
+            "total": len(items),
+            "google_shopping_count": 0,
+            "resolved_count": 0,
+            "retailer_matched_count": 0,
+            "failed_count": 0,
+        }
+
+        for item in items:
+            url = item.shopping_url.strip() if hasattr(item, 'shopping_url') else str(item).strip()
+            if not url:
+                continue
+
+            retailer_hint = getattr(item, 'retailer_hint', None)
+            expected_domain = getattr(item, 'expected_domain', None)
+            product_title = getattr(item, 'title', None)
+
+            # Resolve domain from retailer hint if not provided
+            if retailer_hint and not expected_domain and retailer_identity_service:
+                expected_domain = retailer_identity_service.resolve_brand_to_domain(retailer_hint)
+
+            logger.info(f"[AFFILIATE] Processing: {url[:60]}... (expected: {retailer_hint or expected_domain or 'any'})")
+
+            # Check if it's a Google Shopping URL
+            is_google_shopping = (
+                "ibp=oshop" in url.lower() or
+                ("google.com/search" in url.lower() and "tbm=shop" in url.lower()) or
+                "google.com/shopping" in url.lower()
+            )
+
+            if is_google_shopping:
+                resolution_stats["google_shopping_count"] += 1
+
+                # Initialize SerpClient lazily
+                if serp_client is None:
+                    try:
+                        serp_client = SerpClient()
+                    except Exception as e:
+                        logger.error(f"[AFFILIATE] Failed to initialize SerpClient: {e}")
+                        resolution_stats["failed_count"] += 1
+                        continue
+
+                try:
+                    # Use retailer-preserving resolution
+                    products = serp_client.resolve_google_shopping_url(
+                        google_url=url,
+                        max_products=1,  # One PDP per input URL
+                        expected_retailer=retailer_hint,
+                        expected_domain=expected_domain,
+                        strict_mode=strict_mode,
+                    )
+
+                    if products and len(products) > 0:
+                        resolved = products[0]
+                        resolved_url = resolved.get("url")
+                        actual_store = resolved.get("store", "")
+
+                        # Check if retailer matched
+                        retailer_matched = False
+                        if retailer_hint and retailer_identity_service:
+                            try:
+                                domain = urlparse(resolved_url).netloc.lower().replace("www.", "")
+                                retailer_matched = retailer_identity_service.domain_matches_brand(domain, retailer_hint)
+                            except Exception:
+                                pass
+
+                        if retailer_matched:
+                            resolution_stats["retailer_matched_count"] += 1
+                            logger.info(f"[AFFILIATE] ✅ Retailer MATCHED: {retailer_hint} -> {resolved_url[:60]}...")
+                        else:
+                            logger.info(f"[AFFILIATE] ⚠️ Retailer not matched: expected {retailer_hint}, got {actual_store}")
+
+                        resolved_products.append({
+                            "original_url": url,
+                            "resolved_url": resolved_url,
+                            "expected_retailer": retailer_hint,
+                            "actual_retailer": actual_store,
+                            "retailer_matched": retailer_matched,
+                            "title": resolved.get("title", product_title),
+                            "resolution_source": resolved.get("source_api", "serpapi"),
+                        })
                         resolution_stats["resolved_count"] += 1
-                        logger.info(f"✅ Resolved Google Shopping URL to: {resolved_url[:60]}...")
+                    else:
+                        logger.warning(f"[AFFILIATE] No PDP resolved for: {url[:60]}...")
+                        resolution_stats["failed_count"] += 1
 
-            logger.info(f"Resolution complete: {resolution_stats['resolved_count']}/{resolution_stats['google_shopping_count']} Google Shopping URLs resolved")
+                except Exception as e:
+                    logger.error(f"[AFFILIATE] Resolution failed: {e}")
+                    resolution_stats["failed_count"] += 1
 
-        except Exception as e:
-            logger.warning(f"URL resolution failed, using original URLs: {e}")
-            resolved_urls = original_urls
+            else:
+                # Direct retailer URL - just validate and use
+                resolved_products.append({
+                    "original_url": url,
+                    "resolved_url": url,
+                    "expected_retailer": retailer_hint,
+                    "actual_retailer": None,  # Will be determined from URL
+                    "retailer_matched": None,
+                    "title": product_title,
+                    "resolution_source": "direct",
+                })
+                resolution_stats["resolved_count"] += 1
+
+        logger.info(
+            f"[AFFILIATE] Resolution complete: {resolution_stats['resolved_count']}/{resolution_stats['total']} resolved, "
+            f"{resolution_stats['retailer_matched_count']} retailer-matched, "
+            f"{resolution_stats['failed_count']} failed"
+        )
 
         # ============================================================
-        # STEP 2: Validate URLs (check they return 200 status)
+        # STEP 2: Validate resolved URLs
         # ============================================================
-        logger.info(f"Validating {len(resolved_urls)} URLs...")
-        validation_results = affiliate_client.validate_urls(resolved_urls)
+        urls_to_validate = [p["resolved_url"] for p in resolved_products if p.get("resolved_url")]
+        logger.info(f"[AFFILIATE] Validating {len(urls_to_validate)} URLs...")
 
-        # Filter to valid URLs only
-        valid_urls = [url for url in resolved_urls if validation_results.get(url, {}).get("valid", False)]
-        invalid_count = len(resolved_urls) - len(valid_urls)
+        validation_results = affiliate_client.validate_urls(urls_to_validate)
 
-        if invalid_count > 0:
-            logger.warning(f"{invalid_count} URLs failed validation")
+        # Filter to valid products
+        valid_products = []
+        for product in resolved_products:
+            resolved_url = product.get("resolved_url")
+            if resolved_url and validation_results.get(resolved_url, {}).get("valid", False):
+                valid_products.append(product)
+            else:
+                logger.warning(f"[AFFILIATE] URL failed validation: {resolved_url[:60] if resolved_url else 'None'}...")
+
+        invalid_count = len(resolved_products) - len(valid_products)
 
         # ============================================================
         # STEP 3: Process valid URLs and group by retailer
         # ============================================================
+        valid_urls = [p["resolved_url"] for p in valid_products]
         grouped_products = affiliate_client.process_urls(valid_urls)
+
+        # Build mapping from resolved_url back to product metadata
+        url_to_product = {p["resolved_url"]: p for p in valid_products}
 
         # Build response with retailer carts
         carts = []
         total_products = 0
 
         for retailer, products in grouped_products.items():
-            # Convert to AffiliateProduct models
-            affiliate_products = [
-                AffiliateProduct(
-                    original_url=p["original_url"],
-                    affiliate_url=p["affiliate_url"],
-                    product_id=p["product_id"],
-                )
-                for p in products
-            ]
+            affiliate_products = []
 
-            # Generate cart URL for all products from this retailer
+            for p in products:
+                original_meta = url_to_product.get(p["original_url"], {})
+
+                affiliate_products.append(
+                    AffiliateProduct(
+                        original_url=original_meta.get("original_url", p["original_url"]),
+                        resolved_url=p["original_url"],  # This is actually the resolved URL
+                        affiliate_url=p["affiliate_url"],
+                        product_id=p["product_id"],
+                        product_name=original_meta.get("title"),
+                        expected_retailer=original_meta.get("expected_retailer"),
+                        actual_retailer=retailer,
+                        retailer_matched=original_meta.get("retailer_matched"),
+                        resolution_source=original_meta.get("resolution_source"),
+                    )
+                )
+
+            # Generate cart URL
             product_ids = [p["product_id"] for p in products if p["product_id"] != "unknown"]
 
-            # For Amazon, preserve original regional domain per group (e.g., amazon.ca vs amazon.com)
+            # For Amazon, preserve regional domain
             cart_domain = None
             if retailer == "amazon":
                 try:
-                    from urllib.parse import urlparse
                     first_url = products[0]["original_url"]
                     parsed = urlparse(first_url)
                     if parsed.netloc and "amazon." in parsed.netloc:
                         cart_domain = parsed.netloc
                 except Exception:
-                    cart_domain = None
+                    pass
 
             cart_url = affiliate_client.generate_cart_url(retailer, product_ids, domain=cart_domain)
 
-            # Create retailer cart
             retailer_cart = RetailerCart(
                 retailer=retailer,
                 retailer_display_name=affiliate_client.get_retailer_display_name(retailer),
@@ -1743,24 +1991,103 @@ async def generate_affiliate_cart(request: AffiliateCartRequest):
             carts.append(retailer_cart)
             total_products += len(affiliate_products)
 
-        logger.info(f"Generated {len(carts)} retailer carts with {total_products} total products")
+        logger.info(f"[AFFILIATE] Generated {len(carts)} retailer carts with {total_products} products")
 
         return AffiliateCartResponse(
             carts=carts,
             total_products=total_products,
             total_retailers=len(carts),
             status="success",
-            message=f"Generated {len(carts)} affiliate cart(s) with {total_products} product(s)",
-            urls_processed=len(original_urls),
-            urls_resolved=resolution_stats.get("resolved_count", 0),
-            urls_validated=len(valid_urls),
-            urls_failed=invalid_count,
+            message=f"Generated {len(carts)} affiliate cart(s) with {total_products} product(s). "
+                    f"Retailer match rate: {resolution_stats['retailer_matched_count']}/{resolution_stats['google_shopping_count']} Google Shopping URLs.",
+            urls_processed=resolution_stats["total"],
+            urls_resolved=resolution_stats["resolved_count"],
+            urls_validated=len(valid_products),
+            urls_failed=invalid_count + resolution_stats["failed_count"],
         )
 
     except Exception as e:
         logger.error(f"Failed to generate affiliate cart: {str(e)}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(
             status_code=500, detail=f"Failed to generate affiliate cart: {str(e)}"
+        )
+
+
+# =============================================================================
+# Universal Product Link Normalizer
+# =============================================================================
+
+@app.post("/normalize-urls")
+async def normalize_urls(request: NormalizeURLsRequest):
+    """
+    Normalize product URLs to canonical retailer PDPs.
+
+    Handles:
+    - Google Shopping URLs (extracts retailer links via SerpAPI)
+    - Affiliate/tracking redirect URLs (follows redirect chain)
+    - Direct retailer URLs (validates and extracts canonical)
+
+    Returns normalized URLs grouped by retailer with validation and classification.
+    """
+    try:
+        # Import url_normalizer module (lazy import to avoid startup issues)
+        from url_normalizer.client import URLNormalizerClient
+        from url_normalizer.models import (
+            URLResolution,
+            RetailerGroup,
+            NormalizationTelemetry,
+        )
+
+        # Initialize client with optional SerpClient
+        serp_client = None
+        if request.google_shopping_mode == "serpapi":
+            try:
+                from serp_client import SerpClient
+                serp_client = SerpClient()
+            except Exception as e:
+                logger.warning(f"SerpClient not available for URL normalizer: {e}")
+
+        # Create client
+        client = URLNormalizerClient(
+            serp_client=serp_client,
+            max_concurrent=request.max_concurrent,
+            max_per_domain=request.max_per_domain,
+            timeout_ms=request.timeout_ms,
+        )
+
+        # Normalize URLs
+        resolutions, groups, telemetry = await client.normalize_urls(
+            urls=request.urls,
+            region=request.region,
+            language=request.language,
+            prefer_domains=request.prefer_domains,
+            block_domains=request.block_domains,
+            google_shopping_mode=request.google_shopping_mode,
+            include_classification=request.include_classification,
+            max_candidates_per_url=request.max_candidates_per_url,
+        )
+
+        return {
+            "results": [r.model_dump() for r in resolutions],
+            "groups": [g.model_dump() for g in groups],
+            "telemetry": telemetry.model_dump(),
+            "status": "success",
+            "message": f"Normalized {len(resolutions)} URLs into {len(groups)} retailer groups",
+        }
+
+    except ImportError as e:
+        logger.error(f"URL Normalizer module not available: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail="URL Normalizer service not available. Check dependencies."
+        )
+    except Exception as e:
+        logger.error(f"Failed to normalize URLs: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to normalize URLs: {str(e)}"
         )
 
 

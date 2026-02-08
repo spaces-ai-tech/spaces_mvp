@@ -260,11 +260,30 @@ IMPORTANT: You are the design expert. Even when a user selects a specific color 
 
             # Build the user prompt with the 10-step process
             if let_ai_decide:
-                color_context = """You are a world-class interior designer with COMPLETE CREATIVE FREEDOM.
-Analyze this space and create the PERFECT color palette from scratch.
-You are NOT restricted to any predefined colors or palettes - choose ANY colors that will look stunning.
-Consider color theory, the room's architecture, lighting, mood, and modern design trends.
-Be bold, creative, and professional - recommend colors that would impress clients at a high-end design firm."""
+                # VAPO-optimized prompt (2026-02-07)
+                # Guidelines applied: Underspecified, RedundancyInstructions, Reasoning, Structure
+                color_context = """### CREATIVE COLOR PALETTE TASK
+Analyze this space and propose a professional 5-color palette with rationale.
+
+### INSTRUCTIONS
+- Create exactly 5 distinct colors with descriptive names and specific hex codes.
+- Be bold and creative - suitable for a high-end design project.
+- Consider unexpected combinations and current design trends (2025-2026 palettes).
+- Do NOT use generic colors like pure white (#FFFFFF), pure black (#000000), or basic beige.
+- Mix warm and cool tones for visual interest.
+- Provide a brief rationale explaining why this palette fits the space.
+
+### OUTPUT FORMAT
+Include both the palette and justification:
+
+**Example Palette:**
+- Soft terracotta: #E8A87C
+- Sage green: #85CDCA
+- Dusty rose: #C38D9E
+- Deep teal: #2C6E63
+- Warm cream: #F5E6D3
+
+**Rationale:** [Why these colors work for this specific space]"""
             else:
                 color_context = f"""The user has selected the \"{palette_name}\" palette with colors: {', '.join(palette_colors)}.
 Use these colors as a starting point, but adapt as needed for the best result.
@@ -668,12 +687,27 @@ You are the design expert. Tailor all recommendations specifically to the room s
 
             # Build the user prompt
             if let_ai_decide:
-                style_context = """You are a world-class interior designer with COMPLETE CREATIVE FREEDOM.
-Analyze this room and select the PERFECT design style that will transform this space.
-You are NOT restricted to common styles - you can recommend ANY style from minimalist to maximalist, 
-from classic to avant-garde, or even create a unique fusion of styles.
-Consider the room's architecture, natural lighting, size, existing elements, and modern design trends.
-Be bold, innovative, and professional - recommend a style that would impress clients at a top design studio."""
+                # VAPO-optimized prompt (2026-02-07)
+                # Guidelines applied: Voodoo, Context, Schema, FewShot
+                style_context = """### CREATIVE STYLE RECOMMENDATION TASK
+Analyze this room and recommend a specific, creative design style with justification.
+
+### INSTRUCTIONS
+1. Analyze the room's architecture, lighting, size, and character from the image.
+2. Select or create a design style that best suits the space. Be creative and specific.
+3. You are not limited to common styles. Consider for inspiration:
+   - Trending Styles: "Quiet Luxury", "Dopamine Decor", "Soft Brutalism", "Organic Modern"
+   - Fusion Styles: "Japandi", "Modern Bohemian", "Coastal Grandmother", "Eclectic Maximalism"
+   - Regional Styles: "Mediterranean Revival", "Desert Modern", "Pacific Northwest", "Parisian Chic"
+4. The goal is a unique and tailored recommendation.
+
+### OUTPUT
+Provide the style name and justification explaining how it complements the room's features.
+
+### EXAMPLE
+For a small attic bedroom with exposed dark wood beams and soft diffused light:
+- Style: "Wabi-Sabi Cottage"
+- Justification: The exposed beams and old floors align with Wabi-Sabi's appreciation for natural imperfection, fused with Cottage coziness."""
             else:
                 style_context = f"""The user has selected the \"{style_name}\" style.
 Provide detailed guidance on how to transform this room into that style."""
@@ -786,11 +820,13 @@ REMEMBER: Keep walls, doors, flooring, ceiling unchanged. Focus on furniture, de
                 if downloaded_product_images:
                     print(f"📦 Downloaded {len(downloaded_product_images)} product reference images")
 
-            # Use 'gemini-3-pro-image-preview'
-            model_name = "gemini-3-pro-image-preview"
+            # Primary and fallback models for image generation
+            primary_model = "gemini-3-pro-image-preview"
+            fallback_model = "gemini-2.5-flash-image"  # Stable fallback for 503 errors
 
             config = types.GenerateContentConfig(
                 response_modalities=["IMAGE"],
+                temperature=0.3,  # Low temperature for structure preservation
             )
 
             # Add product reference instruction if we have product images
@@ -812,34 +848,263 @@ MATCH THE PRODUCTS EXACTLY:
             # Add technical requirement for aspect ratio
             final_prompt = f"{prompt}{product_reference_text}\n\nTechnical Requirement: Generate the image with a 1:1 Square Aspect Ratio."
 
-            # Prepare the contents: text prompt + room image + product images
-            contents = [final_prompt, original_room_image] + downloaded_product_images
+            # Prepare contents: Image FIRST for structure preservation, then prompt, then product images
+            contents = [original_room_image, final_prompt] + downloaded_product_images
 
-            print(f"🚀 Sending request to {model_name} with {len(downloaded_product_images)} product images...")
-            response = self.client.models.generate_content(
-                model=model_name,
-                contents=contents,
-                config=config,
-            )
-
+            # Retry logic: Try primary model multiple times, then fallback
+            import time
+            max_retries = 3
+            retry_delay = 5  # seconds between retries
             generated_image_b64 = None
+            model_used = None
+            last_error = None
 
-            # Extract image from response
-            for part in response.parts:
-                if part.inline_data:
-                    generated_image_b64 = base64.b64encode(part.inline_data.data).decode('utf-8')
-                    print("✅ Successfully generated redesign image")
-                    break
+            # Try primary model with retries
+            for attempt in range(max_retries):
+                try:
+                    print(f"🚀 Attempt {attempt + 1}/{max_retries}: Sending request to {primary_model}...")
+                    response = self.client.models.generate_content(
+                        model=primary_model,
+                        contents=contents,
+                        config=config,
+                    )
+
+                    # Extract image from response
+                    for part in response.parts:
+                        if part.inline_data:
+                            generated_image_b64 = base64.b64encode(part.inline_data.data).decode('utf-8')
+                            model_used = primary_model
+                            print(f"✅ Successfully generated redesign image with {primary_model}")
+                            break
+
+                    if generated_image_b64:
+                        break  # Success!
+
+                except Exception as e:
+                    last_error = e
+                    error_str = str(e).lower()
+                    # Check if it's a retryable error (503/overloaded)
+                    if "503" in error_str or "overloaded" in error_str or "unavailable" in error_str:
+                        if attempt < max_retries - 1:
+                            print(f"⚠️ {primary_model} overloaded (attempt {attempt + 1}/{max_retries}), retrying in {retry_delay}s...")
+                            time.sleep(retry_delay)
+                            continue
+                        else:
+                            print(f"⚠️ {primary_model} still overloaded after {max_retries} attempts, trying fallback...")
+                    else:
+                        # Non-recoverable error, raise immediately
+                        raise e
+
+            # If primary failed, try fallback model once
+            if not generated_image_b64:
+                try:
+                    print(f"🔄 Falling back to {fallback_model}...")
+                    response = self.client.models.generate_content(
+                        model=fallback_model,
+                        contents=contents,
+                        config=config,
+                    )
+
+                    for part in response.parts:
+                        if part.inline_data:
+                            generated_image_b64 = base64.b64encode(part.inline_data.data).decode('utf-8')
+                            model_used = fallback_model
+                            print(f"✅ Successfully generated redesign image with {fallback_model} (fallback)")
+                            break
+
+                except Exception as fallback_error:
+                    print(f"❌ Fallback model also failed: {fallback_error}")
+                    # Raise the original error from primary model
+                    if last_error:
+                        raise last_error
+                    raise fallback_error
 
             if not generated_image_b64:
-                 raise ValueError("No image generated in response")
+                if last_error:
+                    raise last_error
+                raise ValueError("No image generated in response")
 
-            return generated_image_b64
+            return generated_image_b64, model_used
 
         except Exception as e:
             print(f"❌ Error generating room redesign: {e}")
             traceback.print_exc()
             raise e
+
+    def edit_room_with_feedback(
+        self,
+        generated_image_base64: str,
+        user_feedback: str,
+    ) -> tuple[str, str]:
+        """
+        Edit an existing generated room image based on user feedback.
+
+        This is a SURGICAL EDIT operation - preserves the image and only
+        modifies what the user specifically requests.
+
+        Args:
+            generated_image_base64: Base64 encoded image to edit
+            user_feedback: User's modification request (e.g., "remove the lamp")
+
+        Returns:
+            Tuple of (edited_image_base64, model_used)
+        """
+        import time
+
+        try:
+            print(f"✏️ Editing room image with user feedback: '{user_feedback[:100]}...'")
+
+            # Decode base64 to PIL Image
+            image_bytes = base64.b64decode(generated_image_base64)
+            input_image = Image.open(BytesIO(image_bytes))
+
+            # VAPO-optimized prompt v2 (2026-02-07)
+            # Guidelines applied: Structure, Underspecified, Reasoning, FewShot
+            # Enhanced with interior design principles for proper placement/grounding
+            edit_prompt = f"""You are an expert interior designer AND professional photo editor.
+
+### TASK
+Edit this room image based on the user's request. This is a SURGICAL EDIT with INTERIOR DESIGN EXPERTISE - you must preserve the original image while making changes that look professionally designed and realistic.
+
+### USER REQUEST
+{user_feedback}
+
+### INTERIOR DESIGN PRINCIPLES - CRITICAL
+When adding or repositioning items, apply professional design knowledge:
+
+1. **PROPER GROUNDING**: All furniture and decor MUST sit realistically on the floor or appropriate surface
+   - Plants must be in pots that sit flat on the floor - never floating or elevated
+   - Floor lamps must stand on the floor with visible base
+   - Objects must respect gravity and physics
+
+2. **SCALE & PROPORTION**: Items must be appropriately sized for the room
+   - Large plants should be 4-6 feet tall for bedrooms/living rooms
+   - Floor lamps should be 5-6 feet tall
+   - Scale must match existing furniture in the room
+
+3. **PLACEMENT & BALANCE**: Position items where a professional designer would
+   - Corner positions for large plants and floor lamps
+   - Consider sight lines and room flow
+   - Create visual balance with existing furniture
+   - Leave appropriate walking space
+
+4. **STYLE COHESION**: New items must match the room's aesthetic
+   - Match the existing color palette and materials
+   - Complement the design style (modern, traditional, etc.)
+   - Coordinate with existing furniture finishes
+
+### IMAGE PRESERVATION CONSTRAINTS
+- MAINTAIN original camera angle, perspective, and framing
+- MAINTAIN original lighting direction and shadows (new items should cast appropriate shadows)
+- NO structural changes to walls, floors, ceiling, windows, doors
+- PRESERVE all furniture/decor NOT mentioned in the request
+
+### PHOTOREALISTIC OUTPUT REQUIREMENTS
+- The edit must look like a real photograph, not AI-generated
+- New items must have realistic shadows matching the room's lighting
+- Edges must blend naturally with the environment
+- Materials and textures must look authentic
+
+### DESIGN PLANNING (Think step-by-step)
+Before generating, plan your edit:
+1. What specific changes does the user want?
+2. Where exactly should new items be placed (consider design principles)?
+3. What style/color should match the existing room?
+4. How will shadows and lighting affect new items?
+
+### OUTPUT
+Generate the edited room image with professionally designed placement of requested changes.
+
+Technical Requirement: Generate the image with a 1:1 Square Aspect Ratio."""
+
+            # Model configuration
+            primary_model = "gemini-3-pro-image-preview"
+            fallback_model = "gemini-2.5-flash-image"
+
+            config = types.GenerateContentConfig(
+                response_modalities=["IMAGE"],
+                temperature=0.2,  # Very low temperature for maximum fidelity to original
+            )
+
+            # Contents: Image FIRST for reference, then edit prompt
+            contents = [input_image, edit_prompt]
+
+            # Retry logic
+            max_retries = 3
+            retry_delay = 5
+            edited_image_b64 = None
+            model_used = None
+            last_error = None
+
+            # Try primary model with retries
+            for attempt in range(max_retries):
+                try:
+                    print(f"🚀 Edit attempt {attempt + 1}/{max_retries}: Sending request to {primary_model}...")
+                    response = self.client.models.generate_content(
+                        model=primary_model,
+                        contents=contents,
+                        config=config,
+                    )
+
+                    # Extract image from response
+                    for part in response.parts:
+                        if part.inline_data:
+                            edited_image_b64 = base64.b64encode(part.inline_data.data).decode('utf-8')
+                            model_used = primary_model
+                            print(f"✅ Successfully edited image with {primary_model}")
+                            break
+
+                    if edited_image_b64:
+                        break
+
+                except Exception as e:
+                    last_error = e
+                    error_str = str(e).lower()
+                    if "503" in error_str or "overloaded" in error_str or "unavailable" in error_str:
+                        if attempt < max_retries - 1:
+                            print(f"⚠️ {primary_model} overloaded (attempt {attempt + 1}/{max_retries}), retrying in {retry_delay}s...")
+                            time.sleep(retry_delay)
+                            continue
+                        else:
+                            print(f"⚠️ {primary_model} still overloaded after {max_retries} attempts, trying fallback...")
+                    else:
+                        raise e
+
+            # Try fallback model if primary failed
+            if not edited_image_b64:
+                try:
+                    print(f"🔄 Falling back to {fallback_model}...")
+                    response = self.client.models.generate_content(
+                        model=fallback_model,
+                        contents=contents,
+                        config=config,
+                    )
+
+                    for part in response.parts:
+                        if part.inline_data:
+                            edited_image_b64 = base64.b64encode(part.inline_data.data).decode('utf-8')
+                            model_used = fallback_model
+                            print(f"✅ Successfully edited image with {fallback_model} (fallback)")
+                            break
+
+                except Exception as fallback_error:
+                    print(f"❌ Fallback model also failed: {fallback_error}")
+                    if last_error:
+                        raise last_error
+                    raise fallback_error
+
+            if not edited_image_b64:
+                if last_error:
+                    raise last_error
+                raise ValueError("No edited image generated in response")
+
+            return edited_image_b64, model_used, edit_prompt
+
+        except Exception as e:
+            print(f"❌ Error editing room image: {e}")
+            traceback.print_exc()
+            raise e
+
     def generate_product_visualization(
         self,
         original_room_image_path: str,
@@ -851,6 +1116,8 @@ MATCH THE PRODUCTS EXACTLY:
         project_data_dir: Optional[Path] = None,
         color_scheme: Dict[str, Any] = None,
         design_style: Dict[str, Any] = None,
+        improvement_mode: Optional[str] = None,
+        trending_products: list = None,
     ) -> Tuple[str, str]:
         """
         Generate a new image showing multiple products integrated into the original room
@@ -876,51 +1143,122 @@ MATCH THE PRODUCTS EXACTLY:
             
             # Create aggregate product title for the prompt
             all_titles = ", ".join(product_titles)
-            
-            # Create prompt
-            generation_prompt = self._create_integration_prompt(
-                space_type=space_type,
-                product_titles=product_titles,
-                inspiration_recommendations=inspiration_recommendations or [],
-                marker_locations=marker_locations or [],
-                custom_prompt=custom_prompt,
-                color_scheme=color_scheme,
-                design_style=design_style,
-            )
+
+            # Create prompt based on improvement mode
+            if improvement_mode == "iterative":
+                # Use iterative/surgical prompt for targeted improvements with additional styling
+                print(f"🔧 Using ITERATIVE prompt (enhanced surgical edits with {len(trending_products or [])} trending products)")
+                generation_prompt = self._create_iterative_prompt(
+                    selected_products=selected_products,
+                    marker_locations=marker_locations or [],
+                    trending_products=trending_products,
+                    style_analysis=design_style,
+                    color_scheme=color_scheme,
+                )
+            else:
+                # Use revamp prompt for complete redesign (default)
+                print(f"🎨 Using REVAMP prompt (full redesign)")
+                generation_prompt = self._create_integration_prompt(
+                    space_type=space_type,
+                    product_titles=product_titles,
+                    inspiration_recommendations=inspiration_recommendations or [],
+                    marker_locations=marker_locations or [],
+                    custom_prompt=custom_prompt,
+                    color_scheme=color_scheme,
+                    design_style=design_style,
+                )
 
             # Configure for Image Generation
-            model_name = "gemini-3-pro-image-preview" 
-            
+            # Lower temperature = more adherent to input structure (reduces "creative" reinterpretation)
+            primary_model = "gemini-3-pro-image-preview"
+            fallback_model = "gemini-2.5-flash-image"  # Stable fallback for 503 errors
+
             config = types.GenerateContentConfig(
                 response_modalities=["IMAGE"],
+                temperature=0.3,  # Low temperature for structure preservation
             )
 
             # Add aspect ratio instruction
             final_prompt = f"{generation_prompt}\n\nTechnical Requirement: Generate the image with a 1:1 Square Aspect Ratio."
 
-            # Prepare contents: prompt + original room + product images
-            contents = [final_prompt, original_room_image] + product_images
+            # Prepare contents: Image FIRST for structure preservation, then prompt, then product images
+            # Order matters: putting original room image first forces model to preserve its structure
+            contents = [original_room_image, final_prompt] + product_images
 
-            print(f"🚀 Sending request to {model_name} with {len(product_images)} product images...")
-            response = self.client.models.generate_content(
-                model=model_name,
-                contents=contents,
-                config=config,
-            )
-
+            # Retry logic: Try primary model multiple times, then fallback
+            import time
+            max_retries = 3
+            retry_delay = 5  # seconds between retries
             generated_image_b64 = None
-            
-            # Extract image from response
-            for part in response.parts:
-                if part.inline_data:
-                    generated_image_b64 = base64.b64encode(part.inline_data.data).decode('utf-8')
-                    print("✅ Successfully generated image")
-                    break
-            
-            if not generated_image_b64:
-                 raise ValueError("No image generated in response")
+            model_used = None
+            last_error = None
 
-            return generated_image_b64, generation_prompt
+            # Try primary model with retries
+            for attempt in range(max_retries):
+                try:
+                    print(f"🚀 Attempt {attempt + 1}/{max_retries}: Sending request to {primary_model} with {len(product_images)} product images...")
+                    response = self.client.models.generate_content(
+                        model=primary_model,
+                        contents=contents,
+                        config=config,
+                    )
+
+                    # Extract image from response
+                    for part in response.parts:
+                        if part.inline_data:
+                            generated_image_b64 = base64.b64encode(part.inline_data.data).decode('utf-8')
+                            model_used = primary_model
+                            print(f"✅ Successfully generated image with {primary_model}")
+                            break
+
+                    if generated_image_b64:
+                        break  # Success!
+
+                except Exception as e:
+                    last_error = e
+                    error_str = str(e).lower()
+                    # Check if it's a retryable error (503/overloaded)
+                    if "503" in error_str or "overloaded" in error_str or "unavailable" in error_str:
+                        if attempt < max_retries - 1:
+                            print(f"⚠️ {primary_model} overloaded (attempt {attempt + 1}/{max_retries}), retrying in {retry_delay}s...")
+                            time.sleep(retry_delay)
+                            continue
+                        else:
+                            print(f"⚠️ {primary_model} still overloaded after {max_retries} attempts, trying fallback...")
+                    else:
+                        # Non-recoverable error, raise immediately
+                        raise e
+
+            # If primary failed, try fallback model once
+            if not generated_image_b64:
+                try:
+                    print(f"🔄 Falling back to {fallback_model}...")
+                    response = self.client.models.generate_content(
+                        model=fallback_model,
+                        contents=contents,
+                        config=config,
+                    )
+
+                    for part in response.parts:
+                        if part.inline_data:
+                            generated_image_b64 = base64.b64encode(part.inline_data.data).decode('utf-8')
+                            model_used = fallback_model
+                            print(f"✅ Successfully generated image with {fallback_model} (fallback)")
+                            break
+
+                except Exception as fallback_error:
+                    print(f"❌ Fallback model also failed: {fallback_error}")
+                    # Raise the original error from primary model
+                    if last_error:
+                        raise last_error
+                    raise fallback_error
+
+            if not generated_image_b64:
+                if last_error:
+                    raise last_error
+                raise ValueError("No image generated in response")
+
+            return generated_image_b64, generation_prompt, model_used
 
         except Exception as e:
             print(f"❌ Error generating product visualization: {e}")
@@ -966,97 +1304,284 @@ MATCH THE PRODUCTS EXACTLY:
         color_scheme: Dict[str, Any] = None,
         design_style: Dict[str, Any] = None,
     ) -> str:
-        """Create a comprehensive prompt for integrating products with PHOTOREALISM focus"""
-        
-        # Build dynamic context
+        """Create an improved prompt for Elite Interior Design Visualization"""
+
+        # Build dynamic context from inputs
         titles_str = ", ".join(product_titles) if product_titles else "new furniture items"
-        
-        style_context = ""
+
+        # Extract style information
+        style_name = "Modern"
+        style_overview = ""
+        materials_list = ""
         if design_style:
-            style = design_style.get("style_name", "")
+            style_name = design_style.get("style_name", "Modern")
+            style_overview = design_style.get("style_overview", "")
             materials = design_style.get("materials", [])
-            if style:
-                style_context = f"Design Style: {style}"
-                if materials:
-                    style_context += f"\nMaterials: {', '.join(materials[:5])}"
-        
-        color_context = ""
+            if materials:
+                materials_list = ", ".join(materials[:7])
+
+        # Extract color palette
+        color_list = ""
         if color_scheme:
-            palette = color_scheme.get("colors", [])
-            if palette:
-                color_context = f"Color Palette: {', '.join(palette)}"
-        
-        placement_context = ""
+            # Handle both old format (colors list) and new format (primary/secondary/accent)
+            if "colors" in color_scheme:
+                color_list = ", ".join(color_scheme.get("colors", []))
+            else:
+                colors = []
+                for key in ["primary_colors", "secondary_colors", "accent_colors"]:
+                    for c in color_scheme.get(key, []):
+                        if isinstance(c, dict):
+                            colors.append(f"{c.get('hex', '')} ({c.get('description', '')})")
+                        else:
+                            colors.append(str(c))
+                color_list = ", ".join(colors[:6])
+
+        # Build marker descriptions
+        marker_descriptions = ""
         if marker_locations:
-            placements = [f"- Marker {i+1}: {m.description}" for i, m in enumerate(marker_locations) if hasattr(m, 'description')]
-            if placements:
-                placement_context = "Placement Areas:\n" + "\n".join(placements)
-        
-        user_request = f"User Request: {custom_prompt}" if custom_prompt else ""
-        
-        # PHOTOREALISM FOCUSED PROMPT
+            markers = []
+            for i, m in enumerate(marker_locations):
+                if hasattr(m, 'description'):
+                    markers.append(f"- Marker {i+1}: {m.description}")
+                elif isinstance(m, dict) and 'description' in m:
+                    markers.append(f"- Marker {i+1}: {m['description']}")
+            if markers:
+                marker_descriptions = "\n".join(markers)
+
+        # User custom request
+        user_request = custom_prompt if custom_prompt else ""
+
+        # THE COMPLETE REVAMP / INTEGRATION PROMPT
         prompt = f"""### ROLE & OBJECTIVE
-You are a master of Architectural Photography and Interior Restoration. Your task is to modify this {space_type} photograph by integrating the following products: {titles_str}.
-The goal is a "Real-Life" photograph, NOT a digital render.
+You are an Elite Interior Design Visualizer and Architectural Photographer.
+Your task is to digitally stage the PROVIDED ROOM PHOTO by EDITING IT (not re-generating a new camera view).
+Goal: a hyper-realistic "After" photo that looks like the user bought new furniture and took another photo from the same spot.
 
-### 1. STRUCTURAL LOCKDOWN (ABSOLUTELY NON-NEGOTIABLE)
-You are EDITING an existing photograph, NOT creating a new room.
+### PRIORITY ORDER (HARD RULES)
+If any instructions conflict, follow this order:
+1) CAMERA/GEOMETRY LOCK
+2) LIGHTING/EXPOSURE/WHITE BALANCE LOCK
+3) MARKERS + USER REQUEST (what to replace)
+4) PRODUCT REFERENCE MATCHING
+5) STYLE + STYLING ADDITIONS
 
-PRESERVE EXACTLY (DO NOT CHANGE):
-- Wall positions, angles, colors, and textures
-- Window locations, sizes, shapes, and frames
-- Door positions, sizes, and frames
-- Flooring type, pattern, color, and boundaries
-- Ceiling height, color, and features (lights, fans, beams)
-- Existing architectural elements (moldings, columns, built-ins, alcoves)
-- Light switch and electrical outlet positions
-- Room dimensions and overall shape
+### 1) THE "IMMUTABLE WORLD" (STRICT CONSTRAINTS)
+You are a decorator, not a builder. The "world" must remain pixel-consistent.
 
-CAMERA MUST MATCH THE ORIGINAL:
-- Exact same viewing angle as the original photo
-- Same focal length (do not zoom in or out)
-- Same horizon line position
-- Same perspective distortion
-- Same field of view boundaries
+**CAMERA & FRAMING LOCK (ABSOLUTE)**
+- Do NOT change camera position, angle, focal length, field of view, crop, rotation, or perspective.
+- Do NOT "recompose" the scene.
+- The output must align with the original photo's background edges (wall corners, baseboards, outlets) with no drift.
+FAIL CONDITION: If framing/perspective changes, the output is INVALID.
 
-SPATIAL PROPORTION CHECK:
-- Room dimensions must be IDENTICAL - if the original shows a 12x14ft room, the output must show the SAME sized space
-- Furniture scale must match the room proportions from the original
-- A person of average height should fit the same way in both images
-- Doorways and windows must appear the same relative size
-- The floor area must remain constant
+**WALLS & FLOORS**
+- Do NOT change wall paint color, flooring material, baseboards, ceiling, windows, doors, outlets, or room geometry unless a marker explicitly instructs it.
 
-FAILURE CRITERIA: If ANY wall moves, window changes position, floor pattern changes, room dimensions change, or the room shape differs from the original - the generation has FAILED.
+**LIGHTING**
+- Do NOT change time of day, shadow direction/hardness, exposure, or white balance.
+- Any flash/harsh shadows/noise in the original must remain consistent.
 
-### 2. PRODUCT REFERENCE IMAGES (CRITICAL)
-You are provided with reference images of the actual products to integrate.
+**BACKGROUND OBJECTS**
+- Do NOT remove background clutter (cords, bottles, random items) unless a marker explicitly says to remove.
 
-MATCH THE PRODUCTS EXACTLY:
-- The furniture in the generated image MUST match the exact color shown in the product reference images
-- Match the exact texture, pattern, and material appearance from the reference
-- Match the exact shape, proportions, and design details
-- Match fabric patterns, wood grain direction, metal finishes exactly as shown
-- DO NOT improvise or change any aspect of the product appearance
+### 2) DESIGN INTELLIGENCE (Apply {style_name})
+You are designing, not just pasting.
 
-USE PRODUCT IMAGES AS AUTHORITATIVE: If there is any doubt about how the product looks, ALWAYS defer to what is shown in the reference image.
+**Cohesion (FULL REVAMP)**
+- Replace key furniture and decor as needed to achieve a complete revamp, while keeping the room shell identical.
+- Automatically generate cohesive supporting pieces (e.g., nightstands, lamps, rug, pillows, throw, wall art) that match the style and palette.
 
-### 3. PHOTOGRAPHIC REALISM PROTOCOLS (CRITICAL)
-LIGHTING PHYSICS: All illumination must come from existing windows and visible lamps in the original. Match the shadow direction and hardness of the original photo exactly.
-MATERIAL AUTHENTICITY: Wood must show natural grain and micro-scratches. Fabrics must show visible weave and realistic folding. Metal must reflect the room environment, not generic white highlights.
-OPTICAL IMPERFECTIONS: Include subtle depth of field, realistic color grading matching the original, and ambient occlusion in corners.
-CAMERA SIMULATION: Emulate a full-frame DSLR with 24-35mm lens. Include minor vignetting matching the original.
+**Styling (Make it feel real)**
+- Bedding must look heavy, soft, and lived-in (wrinkles, weight, layers).
+- Add subtle "real-life" props (e.g., 1 book + 1 small object) ONLY where physically plausible.
 
-### 4. DESIGN CONTEXT
-{style_context}
-{color_context}
-{placement_context}
-{user_request}
+**Palette discipline**
+- Strictly adhere to the Target Palette. Use it primarily in textiles + accents; keep large surfaces calm and {style_name}.
 
-### 5. OUTPUT REQUIREMENT
-Generate a high-resolution photograph that looks IDENTICAL to the original room with only the specified products added/changed.
-If it looks like a "3D render" or has a smooth, plastic, digital appearance, it has FAILED.
-If the room structure differs from the original in ANY way, it has FAILED.
-It MUST look like a before-and-after photo taken by the same camera in the same physical room with only furniture changes."""
+### 3) EXECUTION PLAN (Step-by-Step)
+**Step A: Anchor replacements (Markers + User Selections)**
+- Replace the items indicated by markers.
+- If product reference images exist, match their silhouette, materials, and color very closely.
+
+**Step B: Full revamp fill-in (AI design)**
+- Add only what's needed to create a complete, cohesive {style_name} room:
+  - rug if appropriate
+  - coordinated lamps
+  - pillows/throw layering
+  - minimal wall decor if walls are bare
+Keep it uncluttered.
+
+**Step C: Reality pass (Render physics)**
+- Occlusion: objects must block background correctly.
+- Contact shadows: strong, realistic ambient occlusion at the floor/wall.
+- Cast shadows: match original direction and hardness.
+- Sensor match: match grain/noise and focus blur so new items do not look pasted.
+
+### 4) INPUT DATA CONTEXT
+- Space Type: {space_type}
+- Design Style: {style_name} - {style_overview}
+- Key Materials: {materials_list}
+- Target Palette (HEX): {color_list}
+- Specific Changes (Markers):
+{marker_descriptions}
+- Product References: {titles_str}
+- User Request: {user_request}
+
+### OUTPUT REQUIREMENT
+- Output a 1:1 square image.
+- Must look like a mundane, realistic phone photo of the SAME ROOM, same camera, same lighting.
+- Preserve original ISO grain + color cast across inserted items.
+
+### NEGATIVE INSTRUCTIONS (ANTI-FAIL)
+- Do NOT move the bed to a "better" spot.
+- Do NOT change camera angle, crop, or widen the room.
+- Do NOT clean the room or remove clutter unless told.
+- Do NOT produce studio lighting or showroom perfection."""
+
+        return prompt
+
+    def _create_iterative_prompt(
+        self,
+        selected_products: list,
+        marker_locations: list,
+        trending_products: list = None,
+        style_analysis: dict = None,
+        color_scheme: dict = None,
+    ) -> str:
+        """Create a surgical/iterative prompt for targeted furniture replacement.
+
+        This prompt focuses on small, precise changes - replacing specific items
+        and adding a few complementary styling pieces to enhance the room.
+
+        Args:
+            selected_products: User-selected products to insert
+            marker_locations: Markers indicating what to change
+            trending_products: Additional trending products for styling suggestions
+            style_analysis: Design style context (materials, characteristics)
+            color_scheme: Color palette context (primary, secondary, accent colors)
+        """
+
+        # 1. Format the specific changes from markers
+        changes_list = []
+        for i, m in enumerate(marker_locations):
+            if hasattr(m, 'description'):
+                desc = m.description
+                pos = f"({m.position.x:.2f}, {m.position.y:.2f})" if hasattr(m, 'position') else "marked area"
+            elif isinstance(m, dict):
+                desc = m.get('description', 'Replace item')
+                pos_data = m.get('position', {})
+                pos = f"({pos_data.get('x', 0):.2f}, {pos_data.get('y', 0):.2f})"
+            else:
+                desc = "Replace item"
+                pos = "marked area"
+            changes_list.append(f"TARGET AREA {i+1}: At position {pos}, remove existing item and {desc}.")
+        changes_str = "\n".join(changes_list) if changes_list else "No specific markers provided."
+
+        # 2. Format the specific products (user-selected)
+        product_details = []
+        for p in selected_products:
+            title = p.get('title', 'Unknown product')
+            store = p.get('store', 'Unknown')
+            product_details.append(f"- INSERT ITEM: {title} (Source: {store})")
+        products_str = "\n".join(product_details) if product_details else "No products specified."
+
+        # 3. Format additional recommendations (trending + complementary)
+        additional_recommendations = []
+
+        # Add trending products as styling suggestions
+        if trending_products:
+            for tp in trending_products[:2]:  # Max 2 trending products
+                title = tp.get('title', 'Unknown')
+                additional_recommendations.append(f"- TRENDING: {title}")
+
+        # Add AI-suggested complementary items based on style/color
+        if style_analysis:
+            style_name = style_analysis.get('style_name', '')
+            materials = style_analysis.get('materials', [])
+            if style_name:
+                additional_recommendations.append(f"- STYLE SUGGESTION: Add a {style_name}-inspired accent piece (throw pillow, small vase, or decorative object)")
+            if materials:
+                mat_str = ", ".join(materials[:2]) if isinstance(materials, list) else str(materials)
+                additional_recommendations.append(f"- MATERIAL SUGGESTION: Incorporate {mat_str} textures in props")
+
+        if color_scheme:
+            accent_color = color_scheme.get('accent', {}).get('name', '')
+            if accent_color:
+                additional_recommendations.append(f"- COLOR SUGGESTION: Add a small accent in {accent_color} tone")
+
+        additional_str = "\n".join(additional_recommendations) if additional_recommendations else "Use your design judgment to add 1-2 complementary styling props."
+
+        # 4. The "Iterative / Enhanced Surgical" Prompt - SMALL CHANGES WITH STYLING
+        prompt = f"""### ROLE & OBJECTIVE
+You are a High-End Virtual Stager and Architectural Retoucher.
+Your task is to perform an Enhanced Surgical Design Upgrade by EDITING the PROVIDED ROOM PHOTO (not re-generating a new view).
+Goal: a polished "glow-up" that upgrades the room's value with targeted improvements and thoughtful styling additions.
+
+### PRIORITY ORDER (HARD RULES)
+If any instructions conflict, follow this order:
+1) CAMERA/GEOMETRY LOCK
+2) LIGHTING/EXPOSURE/WHITE BALANCE LOCK
+3) MARKERS (what to change) + DELTA BUDGET (how much can change)
+4) PRODUCT REFERENCE MATCHING
+5) ADDITIONAL STYLING RECOMMENDATIONS
+6) MICRO-STYLING PROTOCOL
+
+### 1) CAMERA & GEOMETRY LOCK (ABSOLUTE PRIORITY)
+- Pixel alignment required: walls/windows/ceiling/background edges must match the original photo.
+- No zoom/crop/rotation/recompose.
+FAIL CONDITION: Any visible framing/perspective drift makes the result INVALID.
+
+### 2) IMMUTABLE WORLD (NO REMODELING)
+- Do NOT paint walls, change flooring, remove clutter, or alter architecture unless markers explicitly instruct it.
+- Do NOT change time-of-day or lighting style; match original exposure + shadow hardness.
+
+### 3) ENHANCED ITERATIVE UPGRADE (EXPANDED DELTA BUDGET)
+This is still NOT a full revamp, but allows for a more complete styling upgrade.
+
+**DELTA BUDGET (EXPANDED)**
+- You may change UP TO:
+  - 2-3 small anchor items (e.g., bedding + throw pillows, OR nightstand + lamp, OR rug + accent chair)
+  - Focus on items that work together as a cohesive upgrade
+- You may add UP TO:
+  - 3-4 styling props total (e.g., books, vases, plants, decorative objects)
+  - Props should be placed naturally throughout the visible area, not just next to changed items
+- You may NOT move large furniture positions (layout stays identical)
+- You may NOT replace ALL furniture at once - keep 60-70% of the room unchanged
+
+### 4) SURGICAL INTEGRATION (Physics)
+- Contact shadows and ambient occlusion must match the existing floor.
+- Cast shadows must match the existing direction/hardness.
+- Match ISO grain/noise, blur, and white balance so edits don't look like stickers.
+
+### 5) THE "GLOW UP" PROTOCOL (Micro-styling)
+- If changing bedding: add layering (throw + pillows) within palette, keep it realistic and slightly wrinkled.
+- If changing a nightstand: style with 1-2 small items on top.
+- If changing a lamp: keep placement identical; upgrade lamp design/material only.
+- Add subtle "real-life" touches: a book, small plant, or decorative object where appropriate.
+
+### 6) INPUT DATA CONTEXT
+**Step A: Remove & Replace (Markers)**
+{changes_str}
+
+**Step B: Insert User-Selected Products**
+{products_str}
+(Match materials/colors of these products exactly to their reference images.)
+
+**Step C: Additional Styling Recommendations**
+{additional_str}
+(Use these suggestions to enhance the room with complementary styling. Pick 1-2 that work well with Step A and B.)
+
+### OUTPUT REQUIREMENT
+- Output a 1:1 square image.
+- Must look like the SAME photo, same camera, same lighting—but noticeably improved with cohesive styling.
+- Keep background clutter unless explicitly instructed.
+- The result should feel like a professional stylist made targeted upgrades.
+
+### NEGATIVE INSTRUCTIONS (ANTI-FAIL)
+- Do NOT recompose, crop, zoom, rotate, or change perspective.
+- Do NOT "upgrade" by moving the bed or changing layout.
+- Do NOT do a full redesign; respect the expanded but limited delta budget.
+- Do NOT exceed 3-4 styling props total."""
 
         return prompt
 

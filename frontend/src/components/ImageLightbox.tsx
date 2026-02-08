@@ -13,7 +13,8 @@ export function ImageLightbox({
   alt,
   onClose,
 }: ImageLightboxProps) {
-  if (!isOpen) return null;
+  // Guard: Don't render if not open or src is empty
+  if (!isOpen || !src) return null;
 
   return (
     <div className="fixed inset-0 z-50">

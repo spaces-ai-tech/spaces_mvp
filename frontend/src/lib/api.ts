@@ -336,6 +336,7 @@ export interface ImageGenerationResponse {
   generation_prompt: string;
   status: string;
   message: string;
+  model_used?: string; // The Gemini model used for generation
 }
 
 export interface ClipRect {
@@ -367,6 +368,7 @@ export interface InspirationImageGenerationResponse {
   inspiration_recommendations: string[];
   status: string;
   message: string;
+  model_used?: string; // The Gemini model used for generation
 }
 
 // Color Agent types
@@ -569,6 +571,35 @@ export const useSelectSpaceType = () => {
       apiClient.post<SpaceTypeResponse>(`/projects/${projectId}/space-type`, {
         space_type: spaceType,
       }),
+    onSuccess: (data) => {
+      // Invalidate the project query to refresh the data
+      queryClient.invalidateQueries({ queryKey: ["project", data.project_id] });
+    },
+  });
+};
+
+interface ImprovementModeResponse {
+  project_id: string;
+  mode: string;
+  status: string;
+  message: string;
+}
+
+export const useSetImprovementMode = () => {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      projectId,
+      mode,
+    }: {
+      projectId: string;
+      mode: "iterative" | "complete_revamp";
+    }) =>
+      apiClient.post<ImprovementModeResponse>(
+        `/projects/${projectId}/improvement-mode`,
+        { mode }
+      ),
     onSuccess: (data) => {
       // Invalidate the project query to refresh the data
       queryClient.invalidateQueries({ queryKey: ["project", data.project_id] });
@@ -809,6 +840,27 @@ export const useGenerateInspirationRedesign = () => {
     mutationFn: (projectId: string) =>
       apiClient.post<InspirationImageGenerationResponse>(
         `/projects/${projectId}/inspiration-redesign`
+      ),
+    onSuccess: (data) => {
+      queryClient.invalidateQueries({ queryKey: ["project", data.project_id] });
+    },
+  });
+};
+
+export const useRetryRedesign = () => {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      projectId,
+      feedback,
+    }: {
+      projectId: string;
+      feedback: string;
+    }) =>
+      apiClient.post<InspirationImageGenerationResponse>(
+        `/projects/${projectId}/retry-redesign`,
+        { feedback }
       ),
     onSuccess: (data) => {
       queryClient.invalidateQueries({ queryKey: ["project", data.project_id] });

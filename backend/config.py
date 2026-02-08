@@ -17,6 +17,11 @@ class FeatureFlags:
 
     # Phase 1: Safe internal improvements (default ON)
 
+    # Use google_shopping_light API for direct retailer URLs instead of Google Shopping redirects
+    # This returns 'link' field with actual retailer URLs (wayfair.com, target.com, etc.)
+    # instead of broken google.com/shopping/product/... URLs
+    USE_SHOPPING_LIGHT_API = os.getenv("USE_SHOPPING_LIGHT_API", "true").lower() == "true"
+
     # CLIP Model - Use larger, more accurate model
     # +5-8% matching accuracy, ~2.5x slower (acceptable trade-off)
     USE_CLIP_LARGE = os.getenv("USE_CLIP_LARGE", "true").lower() == "true"
@@ -282,6 +287,61 @@ HARD_NEGATIVES = [
 ]
 
 
+# ============================================================
+# Product Search Exclusions - Filter out Plans, Blueprints, PDFs
+# These are NOT actual furniture products - they are drawings/documents
+# ============================================================
+EXCLUDED_PRODUCT_KEYWORDS = [
+    # Plans and blueprints (common Google Shopping false positives)
+    "plan", "plans",
+    "pdf", "pdf download",
+    "blueprint", "blueprints",
+    "woodworking plan", "woodworking plans",
+    "furniture plan", "furniture plans",
+    "building plan", "building plans",
+
+    # DIY guides and instructions
+    "diy guide", "diy project",
+    "build your own",
+    "how to build",
+    "instructions",
+    "step by step",
+
+    # Templates and patterns
+    "template", "templates",
+    "pattern", "patterns",
+    "cutting list",
+    "cut list",
+
+    # Digital downloads
+    "digital download",
+    "instant download",
+    "printable",
+    "e-book", "ebook",
+]
+
+
+def is_valid_product(title: str) -> bool:
+    """
+    Filter out plans, blueprints, PDFs - we need real furniture photos.
+
+    Products with these keywords in their title are NOT actual furniture,
+    they are drawings or documents. Including them causes image generation
+    to fail because the reference images are line drawings, not photos.
+
+    Args:
+        title: Product title from search results
+
+    Returns:
+        True if the product appears to be actual furniture (not a plan/blueprint)
+    """
+    if not title:
+        return True  # Empty titles pass through for other filters
+
+    title_lower = title.lower()
+    return not any(keyword in title_lower for keyword in EXCLUDED_PRODUCT_KEYWORDS)
+
+
 # Bed component configuration for composite furniture detection
 # When a bed is detected, search for these additional components
 BED_COMPONENTS = {
@@ -313,12 +373,18 @@ BED_COMPONENTS = {
 # Primary bed indicators - terms that definitively indicate sleeping furniture
 # These are checked AFTER exclusions, so multi-word terms are preferred
 BED_PRIMARY_INDICATORS = [
+    # Standard bed types
     "bed frame", "platform bed", "sleigh bed", "canopy bed",
     "four poster", "poster bed", "panel bed", "upholstered bed",
     "storage bed", "captain's bed", "trundle bed", "bunk bed",
     "murphy bed", "daybed", "sleeper sofa", "sofa bed",
     "headboard", "footboard", "mattress", "loft bed",
     "king bed", "queen bed", "twin bed", "full bed",
+    # Tufted/styled bed variants (common Gemini responses)
+    "tufted bed", "channel tufted bed", "button tufted bed",
+    "wingback bed", "wingback headboard", "tufted headboard",
+    "upholstered headboard", "velvet bed", "linen bed",
+    "fabric bed", "leather bed", "wood bed", "metal bed",
 ]
 
 # Exclusion terms - if these appear in the label, it's NOT a bed
@@ -464,6 +530,175 @@ QUALITY_RETAILER_SCORES = {
 
 
 # ============================================================
+# Non-Retailer Domain Blocklist
+# These domains never sell furniture - always filter them from reverse image search
+# ============================================================
+
+NON_RETAILER_BLOCKLIST = {
+    # Social Media
+    "instagram.com",
+    "pinterest.com",
+    "pinterest.co.uk",
+    "pin.it",
+    "facebook.com",
+    "fb.com",
+    "twitter.com",
+    "x.com",
+    "tiktok.com",
+    "youtube.com",
+    "youtu.be",
+    "linkedin.com",
+    "reddit.com",
+    "tumblr.com",
+
+    # Blogs & Editorial Platforms
+    "medium.com",
+    "blogspot.com",
+    "wordpress.com",
+    "wordpress.org",
+    "blogger.com",
+    "substack.com",
+    "wix.com",
+    "squarespace.com",
+
+    # Magazines & Editorial Sites (feature furniture, don't sell it)
+    "architecturaldigest.com",
+    "elledecor.com",
+    "housebeautiful.com",
+    "apartmenttherapy.com",
+    "dwell.com",
+    "dezeen.com",
+    "designmilk.com",
+    "mydomaine.com",
+    "domino.com",
+    "veranda.com",
+    "hgtv.com",
+    "bhg.com",
+    "countryliving.com",
+    "realsimple.com",
+    "marthastewart.com",
+    "thekitchn.com",
+    "remodelista.com",
+    "curbed.com",
+    "lonny.com",
+
+    # Woodworking / Plans (NOT product sellers)
+    "finewoodworking.com",
+    "woodmagazine.com",
+    "popularwoodworking.com",
+    "woodworkersjournal.com",
+    "woodsmith.com",
+    "ana-white.com",
+    "thedesignconfidential.com",
+    "shanty-2-chic.com",
+
+    # Stock Photos / Image Sites
+    "shutterstock.com",
+    "istockphoto.com",
+    "gettyimages.com",
+    "unsplash.com",
+    "pexels.com",
+    "pixabay.com",
+    "depositphotos.com",
+    "123rf.com",
+    "alamy.com",
+    "dreamstime.com",
+
+    # Review / Comparison Sites (may link but don't sell)
+    "thespruce.com",
+    "bobvila.com",
+    "consumerreports.org",
+    "nytimes.com",
+    "wirecutter.com",
+    "cnet.com",
+    "tomsguide.com",
+    "reviewed.com",
+    "goodhousekeeping.com",
+
+    # Classifieds / Used Items
+    "craigslist.org",
+    "kijiji.ca",
+    "gumtree.com",
+    "offerup.com",
+    "letgo.com",
+    "mercari.com",
+    "poshmark.com",
+    "thredup.com",
+}
+
+# Title patterns that indicate non-product content (DIY plans, tutorials, etc.)
+NON_PRODUCT_TITLE_PATTERNS = [
+    "diy plan",
+    "diy project",
+    "woodworking plan",
+    "build plan",
+    "furniture plan",
+    "free plan",
+    "pdf plan",
+    "blueprint",
+    "how to build",
+    "how to make",
+    "tutorial",
+    "step by step",
+    "building instructions",
+    "diy guide",
+    "craft project",
+    "wood plan",
+    "cut list",
+    "materials list",
+]
+
+
+def is_blocked_domain(url: str) -> bool:
+    """
+    Check if URL is from a non-retailer domain that should be blocked.
+
+    Args:
+        url: URL to check
+
+    Returns:
+        True if URL should be blocked (not a retailer)
+    """
+    if not url:
+        return False
+
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(url.lower())
+        domain = parsed.netloc.replace("www.", "")
+
+        # Check exact match
+        if domain in NON_RETAILER_BLOCKLIST:
+            return True
+
+        # Check if any blocklist domain is a suffix (for subdomains)
+        for blocked in NON_RETAILER_BLOCKLIST:
+            if domain.endswith(f".{blocked}"):
+                return True
+
+        return False
+    except Exception:
+        return False
+
+
+def is_non_product_title(title: str) -> bool:
+    """
+    Check if title indicates non-product content (DIY plans, tutorials, etc.).
+
+    Args:
+        title: Product/result title to check
+
+    Returns:
+        True if title suggests this is NOT a purchasable product
+    """
+    if not title:
+        return False
+
+    title_lower = title.lower()
+    return any(pattern in title_lower for pattern in NON_PRODUCT_TITLE_PATTERNS)
+
+
+# ============================================================
 # AI Product Curation Settings
 # Controls how Gemini Vision evaluates product quality
 # ============================================================
@@ -471,23 +706,109 @@ QUALITY_RETAILER_SCORES = {
 AI_PRODUCT_CURATION = {
     # Enable/disable AI curation (can be overridden by env var)
     "enabled": True,
-    
+
     # Minimum quality score to include product (0.0-1.0)
     "min_quality_score": 0.5,
-    
+
     # Maximum products to evaluate per category (cost control)
     "max_products_to_evaluate": 16,
-    
+
     # Products per Gemini batch request
     "batch_size": 8,
-    
+
     # Score weighting (must sum to 1.0)
     "score_weights": {
         "visual_quality": 0.35,     # Image clarity, professional photography
         "design_aesthetic": 0.35,   # Modern, premium look vs generic
         "style_match": 0.30,        # Fits requested style/room
     },
-    
+
     # Minimum image dimensions to consider (pixels)
     "min_image_dimension": 200,
+}
+
+
+# ============================================================
+# URL Normalizer Configuration
+# Settings for the Universal Product Link Normalizer
+# ============================================================
+
+URL_NORMALIZER_CONFIG = {
+    # Enable/disable the URL normalizer feature
+    "enabled": os.getenv("URL_NORMALIZER_ENABLED", "true").lower() == "true",
+
+    # Concurrency settings
+    "max_concurrent": int(os.getenv("URL_NORMALIZER_MAX_CONCURRENT", "15")),
+    "max_per_domain": int(os.getenv("URL_NORMALIZER_MAX_PER_DOMAIN", "3")),
+
+    # Timeout settings (milliseconds)
+    "default_timeout_ms": int(os.getenv("URL_NORMALIZER_TIMEOUT_MS", "10000")),
+
+    # Redirect resolution
+    "max_redirects": 10,
+
+    # Product page classification threshold (0.0-1.0)
+    "classification_threshold": 0.50,
+
+    # Google Shopping settings
+    "max_shopping_candidates": 3,
+
+    # Cache TTLs (seconds)
+    "cache_ttl": {
+        "redirect_resolution": 24 * 60 * 60,    # 1 day
+        "canonical_extraction": 7 * 24 * 60 * 60,  # 7 days
+        "validation_result": 12 * 60 * 60,       # 12 hours
+        "shopping_candidates": 3 * 24 * 60 * 60,  # 3 days
+    },
+}
+
+
+# ============================================================
+# VAPO (Vertex AI Prompt Optimizer) Configuration
+# Settings for prompt optimization and A/B testing
+# ============================================================
+
+VAPO_CONFIG = {
+    # Master feature flag for prompt optimization
+    "enabled": os.getenv("VAPO_ENABLED", "true").lower() == "true",
+
+    # GCP project and location for Vertex AI
+    "project_id": os.getenv("GOOGLE_CLOUD_PROJECT", None),
+    "location": os.getenv("VAPO_LOCATION", "us-central1"),
+
+    # A/B test allocation (0.0-1.0)
+    # Fraction of traffic routed to optimized prompts
+    "ab_test_allocation": float(os.getenv("VAPO_AB_TEST_ALLOCATION", "0.0")),
+
+    # Enable usage logging for metrics tracking
+    "enable_logging": os.getenv("VAPO_ENABLE_LOGGING", "true").lower() == "true",
+
+    # Path to prompts directory (relative to backend/)
+    "prompts_dir": os.getenv("VAPO_PROMPTS_DIR", "prompts"),
+
+    # Zero-shot optimization settings
+    "zero_shot": {
+        # Auto-apply zero-shot suggestions (vs manual review)
+        "auto_apply": os.getenv("VAPO_ZERO_SHOT_AUTO_APPLY", "false").lower() == "true",
+    },
+
+    # Data-driven optimization settings
+    "data_driven": {
+        # Minimum samples required for data-driven optimization
+        "min_samples": int(os.getenv("VAPO_MIN_SAMPLES", "50")),
+        # Default target model for optimization
+        "target_model": os.getenv("VAPO_TARGET_MODEL", "gemini-2.5-flash"),
+        # QPS limit for optimization jobs
+        "qps": int(os.getenv("VAPO_QPS", "1")),
+    },
+
+    # Priority prompts for optimization (in order)
+    "priority_prompts": [
+        "revamp_integration",
+        "iterative_surgical",
+        "color_agent",
+        "style_agent",
+        "room_redesign",
+        "object_detection",
+    ],
 }

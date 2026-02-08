@@ -61,19 +61,37 @@ class SpatialDetector:
             
             prompt = f"""Analyze this interior room image. The user clicked at ({click_x_pct}% from left, {click_y_pct}% from top).
 
+CLICK PROXIMITY RULE (CRITICAL - READ FIRST):
+The PRIMARY item MUST be the object that the user's click point ({click_x_pct}%, {click_y_pct}%) is DIRECTLY on.
+- If clicking on a LAMP sitting on a nightstand, primary = "table lamp", NOT "nightstand"
+- If clicking on a VASE on a console table, primary = "vase", NOT "console table"
+- If clicking on a PLANT on a side table, primary = "potted plant", NOT "side table"
+- If clicking on a BOOK on a shelf, primary = "book", NOT "bookshelf"
+- Smaller decorative items (lamps, vases, plants, sculptures, clocks, picture frames) should be PRIMARY when clicked directly on them
+- Larger furniture (tables, nightstands, consoles, shelves) should only be PRIMARY if the click is NOT on a smaller item sitting on them
+- The supporting furniture goes in additional_items when a smaller item is clicked
+
+EXCEPTION - BED PRIORITY: This rule does NOT apply to beds. Clicking anywhere on a bed area (headboard, mattress, bedding, pillows) should ALWAYS return the bed frame as PRIMARY (see BED FRAME PRIORITY RULE below).
+
 TASK: Identify ALL DISTINCT furniture and decor items at or overlapping this click location.
 
 IMPORTANT - SEPARATE OVERLAPPING ITEMS:
-- A lamp ON a nightstand = 2 items: "table lamp" AND "nightstand"
-- Bedding ON a bed = multiple items: "duvet/comforter", "pillows", "bed frame"
+- A lamp ON a nightstand = 2 items: "table lamp" (PRIMARY if clicked on lamp) AND "nightstand" (in additional_items)
+- Bedding ON a bed = multiple items: "bed frame" (ALWAYS PRIMARY), "duvet/comforter" (additional), "pillows" (additional)
 
 CRITICAL DISTINCTIONS FOR BEDS:
 - "bed frame" = the STRUCTURAL furniture piece (headboard, footboard, rails, legs) - this is FURNITURE
 - "bedding/duvet/comforter" = the FABRIC covering ON TOP of the bed - this is TEXTILE
 - "pillows" = cushions on the bed - these are ACCESSORIES
-- When clicking on the HEADBOARD area of a bed, the PRIMARY item is the BED FRAME, not the bedding
 - An "upholstered bed" is a BED FRAME with fabric upholstery - it is NOT bedding
 - Note distinctive features: tufting style (channel, button, diamond), headboard shape (wingback, panel, arched), leg material/color (gold, brass, wood, chrome)
+
+BED FRAME PRIORITY RULE (CRITICAL - ALWAYS FOLLOW):
+- If the click is ANYWHERE on or near a bed (headboard, mattress, bedding, pillows, footboard, frame rails, or any part of the bed area), the PRIMARY item MUST ALWAYS be a bed frame variant
+- Use specific bed frame labels like: "platform bed", "upholstered bed frame", "panel bed", "tufted bed frame", "sleigh bed", "canopy bed", "storage bed", "channel tufted bed", "wingback bed"
+- NEVER return "bedding", "duvet", "comforter", "quilt", "sheets", or "pillows" as the PRIMARY item - these MUST ONLY appear in ADDITIONAL_ITEMS
+- If you see upholstered/tufted furniture that is bed-sized (large enough to sleep on), ALWAYS label it as "[style] bed frame" or "[style] bed", NOT "[style] furniture" or "[style] upholstered piece"
+- The bed frame is ALWAYS the most important item when clicking on a bed, regardless of where on the bed the user clicked
 
 BE SPECIFIC with labels:
 - "channel tufted upholstered bed" not "duvet cover"

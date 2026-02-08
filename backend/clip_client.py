@@ -166,13 +166,17 @@ class CLIPClient:
             self.logger.error(f"Failed to compute similarity: {e}")
             return 0.0
     
-    def analyze_furniture_region(self, image_input) -> Dict[str, Any]:
+    def analyze_furniture_region(self, image_input, crop_ratio: float = None) -> Dict[str, Any]:
         """
         Analyze a furniture region and generate descriptive attributes
-        
+
         Args:
             image_input: Image to analyze (PIL Image, path, or base64)
-            
+            crop_ratio: Size of crop relative to full image (0.0-1.0).
+                        Used to deprioritize large furniture if crop is small.
+                        A side table crop is typically ~5-10% of image area,
+                        while a bed would be ~30-50%.
+
         Returns:
             Dictionary with furniture attributes and descriptions
         """
@@ -233,7 +237,34 @@ class CLIPClient:
             style_scores = score_categories(styles)
             material_scores = score_categories(materials)
             color_scores = score_categories(colors)
-            
+
+            # Size-based deprioritization: If crop is small (<15% of image),
+            # deprioritize large furniture types that are unlikely to fit
+            # in such a small area (e.g., bed, sofa, sectional, dining table)
+            LARGE_FURNITURE = {
+                "bed", "trundle bed", "sofa", "sectional", "dining table",
+                "sectional sofa", "king bed", "queen bed", "sleeper sofa",
+                "l-shaped sectional", "u-shaped sectional"
+            }
+            if crop_ratio is not None and crop_ratio < 0.15:
+                self.logger.debug(
+                    f"Small crop detected (ratio={crop_ratio:.3f}), "
+                    f"deprioritizing large furniture types"
+                )
+                adjusted_scores = []
+                for name, score in furniture_scores:
+                    if name.lower() in LARGE_FURNITURE:
+                        # Halve confidence for large furniture in small crops
+                        adjusted_score = score * 0.5
+                        self.logger.debug(
+                            f"  Deprioritized '{name}': {score:.3f} -> {adjusted_score:.3f}"
+                        )
+                        adjusted_scores.append((name, adjusted_score))
+                    else:
+                        adjusted_scores.append((name, score))
+                # Re-sort after adjustment
+                furniture_scores = sorted(adjusted_scores, key=lambda x: x[1], reverse=True)
+
             # Get top matches
             top_furniture = furniture_scores[0] if furniture_scores else ("furniture", 0.5)
             top_style = style_scores[0] if style_scores else ("modern", 0.5)

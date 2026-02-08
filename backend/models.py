@@ -392,6 +392,35 @@ class SpaceTypeResponse(BaseModel):
     message: str = "Space type selected successfully"
 
 
+class ImprovementModeRequest(BaseModel):
+    """
+    Request model for setting the improvement mode of a project.
+
+    Attributes:
+        mode (str): 'iterative' or 'complete_revamp'
+    """
+    mode: str = Field(
+        ...,
+        description="'iterative' for enhancing existing setup, 'complete_revamp' for full redesign"
+    )
+
+
+class ImprovementModeResponse(BaseModel):
+    """
+    Response model for improvement mode selection.
+
+    Attributes:
+        project_id (str): ID of the project
+        mode (str): The selected improvement mode
+        status (str): Status of the operation
+        message (str): Human-readable message
+    """
+    project_id: str
+    mode: str
+    status: str
+    message: str = "Improvement mode set successfully"
+
+
 class MarkerPosition(BaseModel):
     """
     Model representing the position of a marker on an image.
@@ -480,6 +509,10 @@ class ProjectContext(BaseModel):
     # Core data
     base_image: Optional[str] = None
     is_base_image_empty_room: Optional[bool] = None
+    improvement_mode: Optional[str] = Field(
+        default=None,
+        description="'iterative' for enhancing existing setup, 'complete_revamp' for full redesign"
+    )
     space_type: Optional[str] = None
     improvement_markers: List[ImprovementMarker] = Field(default_factory=list)
     labelled_base_image: Optional[str] = None
@@ -519,19 +552,25 @@ class ProjectContext(BaseModel):
     generation_prompt: Optional[str] = Field(
         default=None, description="The prompt used for Gemini image generation"
     )
+    generation_model_used: Optional[str] = Field(
+        default=None, description="The Gemini model used for image generation"
+    )
     color_scheme: Optional[Dict[str, Any]] = Field(
         default=None, description="Selected color scheme for image generation"
     )
     design_style: Optional[Dict[str, Any]] = Field(
         default=None, description="Selected design style for image generation"
     )
-    
+
     # Inspiration-based image generation
     inspiration_generated_image_base64: Optional[str] = Field(
         default=None, description="Base64 encoded inspiration-redesigned image"
     )
     inspiration_generation_prompt: Optional[str] = Field(
         default=None, description="The prompt used for inspiration-based generation"
+    )
+    inspiration_model_used: Optional[str] = Field(
+        default=None, description="The Gemini model used for inspiration redesign"
     )
     
     # Color Agent analysis
@@ -891,6 +930,7 @@ class ImageGenerationResponse(BaseModel):
     generation_prompt: str
     status: str
     message: str = "Image generation completed successfully"
+    model_used: Optional[str] = None  # The Gemini model used for generation
 
 
 class InspirationImageGenerationResponse(BaseModel):
@@ -904,6 +944,7 @@ class InspirationImageGenerationResponse(BaseModel):
         inspiration_recommendations (List[str]): The inspiration recommendations used
         status (str): Status of the generation operation
         message (str): Human-readable message about the result
+        model_used (str): The Gemini model used for generation
     """
 
     project_id: str
@@ -912,6 +953,17 @@ class InspirationImageGenerationResponse(BaseModel):
     inspiration_recommendations: List[str]
     status: str
     message: str = "Inspiration-based image redesign completed successfully"
+    model_used: Optional[str] = None  # The Gemini model used for generation
+
+
+class RetryRedesignRequest(BaseModel):
+    """
+    Request model for retry redesign with user feedback.
+
+    Used when a user wants to edit the existing generated image
+    by providing specific modification instructions.
+    """
+    feedback: str = Field(..., description="User's modification request (e.g., 'remove the lamp', 'add a plant')")
 
 
 class ClipRect(BaseModel):
@@ -1065,12 +1117,55 @@ class ClipSearchResponse(BaseModel):
 # ============================================================================
 
 
+class AffiliateProductItem(BaseModel):
+    """
+    Model for a product item with retailer context for affiliate resolution.
+
+    This is the KEY to retailer-preserving resolution:
+    - shopping_url: The Google Shopping or product URL
+    - retailer_hint: The expected retailer from "source" field (e.g., "Quince")
+    - expected_domain: Optional explicit domain (e.g., "quince.com")
+    - title: Product title for keyword matching
+    """
+    shopping_url: str = Field(..., description="Google Shopping or product URL")
+    retailer_hint: Optional[str] = Field(
+        None,
+        description="Expected retailer name from 'source' field (e.g., 'Quince', 'West Elm')"
+    )
+    expected_domain: Optional[str] = Field(
+        None,
+        description="Expected retailer domain (e.g., 'quince.com')"
+    )
+    title: Optional[str] = Field(None, description="Product title for keyword matching")
+    image_url: Optional[str] = Field(None, description="Product image URL")
+    price: Optional[float] = Field(None, description="Product price")
+    price_str: Optional[str] = Field(None, description="Price string (e.g., '$169.00')")
+
+
 class AffiliateCartRequest(BaseModel):
     """
     Request model for generating affiliate cart from product URLs.
+
+    IMPORTANT: Use 'items' with retailer hints for retailer-preserving resolution.
+    The old 'product_urls' field is still supported for backward compatibility,
+    but will use non-strict resolution (may return marketplace alternatives).
     """
-    product_urls: List[str] = Field(
-        ..., description="List of product URLs to convert to affiliate links"
+    # New API: structured items with retailer context
+    items: Optional[List[AffiliateProductItem]] = Field(
+        None,
+        description="List of product items with retailer hints (RECOMMENDED)"
+    )
+
+    # Legacy API: simple URL list (backward compatible, non-strict)
+    product_urls: Optional[List[str]] = Field(
+        None,
+        description="[DEPRECATED] List of product URLs - use 'items' instead for retailer-preserving resolution"
+    )
+
+    # Resolution settings
+    strict_mode: bool = Field(
+        default=True,
+        description="If True, fail instead of returning wrong retailer. Set False to allow marketplace fallbacks."
     )
 
 
@@ -1078,10 +1173,16 @@ class AffiliateProduct(BaseModel):
     """
     Model for a single product with affiliate link.
     """
-    original_url: str = Field(..., description="Original product URL")
+    original_url: str = Field(..., description="Original product URL (input)")
+    resolved_url: Optional[str] = Field(None, description="Resolved retailer PDP URL")
     affiliate_url: str = Field(..., description="Affiliate version of the URL")
     product_id: str = Field(..., description="Extracted product ID")
     product_name: Optional[str] = Field(None, description="Product name if available")
+    # Resolution metadata
+    expected_retailer: Optional[str] = Field(None, description="Expected retailer from input hint")
+    actual_retailer: Optional[str] = Field(None, description="Actual retailer from resolved URL")
+    retailer_matched: Optional[bool] = Field(None, description="Whether resolved retailer matches expected")
+    resolution_source: Optional[str] = Field(None, description="How the URL was resolved (direct_link, google_product_api, fallback)")
 
 
 class RetailerCart(BaseModel):
@@ -1303,3 +1404,71 @@ class ProcessFurnitureSelectionResponse(BaseModel):
     unresolved_count: int = Field(..., description="Number of URLs that could not be resolved")
     status: str = Field(default="success")
     message: str = Field(default="Products processed successfully")
+
+
+# ============================================================================
+# Universal Product Link Normalizer Models
+# ============================================================================
+
+class NormalizeURLsRequest(BaseModel):
+    """Request model for URL normalization endpoint."""
+    urls: List[str] = Field(
+        ...,
+        description="List of URLs to normalize",
+        min_length=1,
+        max_length=100,
+    )
+
+    # Configuration
+    region: str = Field(default="us", description="Target region for shopping results")
+    language: str = Field(default="en", description="Target language")
+    prefer_domains: List[str] = Field(
+        default_factory=list,
+        description="Preferred retailer domains (sorted first in groups)",
+    )
+    block_domains: List[str] = Field(
+        default_factory=list,
+        description="Domains to exclude from results",
+    )
+    timeout_ms: int = Field(
+        default=10000,
+        ge=1000,
+        le=30000,
+        description="Per-URL timeout in milliseconds",
+    )
+
+    # Modes
+    google_shopping_mode: str = Field(
+        default="serpapi",
+        description="How to handle Google Shopping URLs: 'serpapi' or 'disabled'",
+    )
+    include_classification: bool = Field(
+        default=True,
+        description="Whether to run product page classification",
+    )
+
+    # Advanced options
+    max_candidates_per_url: int = Field(
+        default=3,
+        ge=1,
+        le=5,
+        description="Max Google Shopping candidates to try",
+    )
+    max_concurrent: int = Field(
+        default=15,
+        ge=1,
+        le=50,
+        description="Maximum total concurrent requests",
+    )
+    max_per_domain: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="Maximum concurrent requests per domain",
+    )
+
+
+# Note: NormalizeURLsResponse and related models (URLResolution, RetailerGroup,
+# NormalizationTelemetry) are defined in url_normalizer/models.py to avoid
+# circular imports. Import them directly when needed:
+# from url_normalizer.models import URLResolution, RetailerGroup, NormalizationTelemetry
