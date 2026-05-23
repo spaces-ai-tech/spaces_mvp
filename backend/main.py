@@ -707,10 +707,22 @@ async def health_check():
     return {"status": "healthy", "message": "AI Interior Design Agent is running"}
 
 
+@app.head("/health", include_in_schema=False)
+async def health_check_head():
+    """Allow external uptime checks that use HEAD."""
+    return JSONResponse(status_code=200, content=None)
+
+
 @app.get("/")
 async def root():
     """Root API endpoint"""
     return {"message": "Welcome to AI Interior Design Agent API"}
+
+
+@app.head("/", include_in_schema=False)
+async def root_head():
+    """Allow external uptime checks that use HEAD."""
+    return JSONResponse(status_code=200, content=None)
 
 
 @app.get("/usage")

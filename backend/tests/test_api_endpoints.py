@@ -26,11 +26,19 @@ class TestHealthAndRoot:
         assert body["status"] == "healthy"
         assert "running" in body["message"].lower()
 
+    def test_health_check_head(self, client):
+        resp = client.head("/health")
+        assert resp.status_code == 200
+
     def test_root(self, client):
         resp = client.get("/")
         assert resp.status_code == 200
         body = resp.json()
         assert "message" in body
+
+    def test_root_head(self, client):
+        resp = client.head("/")
+        assert resp.status_code == 200
 
 
 # ============================================================================
